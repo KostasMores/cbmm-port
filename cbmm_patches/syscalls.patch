@@ -1,0 +1,27 @@
+diff --git a/arch/x86/entry/syscalls/syscall_64.tbl b/arch/x86/entry/syscalls/syscall_64.tbl
+index 9fc1824fd..9ed767161 100644
+--- a/arch/x86/entry/syscalls/syscall_64.tbl
++++ b/arch/x86/entry/syscalls/syscall_64.tbl
+@@ -357,7 +357,7 @@
+ 433    common  fspick                  __x64_sys_fspick
+ 434    common  pidfd_open              __x64_sys_pidfd_open
+ 435    common  clone3                  __x64_sys_clone3/ptregs
+-436     64      init_badger_trap        __x64_sys_init_badger_trap
++440 64      init_badger_trap        __x64_sys_init_badger_trap
+
+ #
+ # x32-specific system call numbers start at 512 to avoid cache impact
+diff --git a/include/uapi/asm-generic/unistd.h b/include/uapi/asm-generic/unistd.h
+index 1fc8faa6e..936a6eba0 100644
+--- a/include/uapi/asm-generic/unistd.h
++++ b/include/uapi/asm-generic/unistd.h
+@@ -850,9 +850,11 @@ __SYSCALL(__NR_pidfd_open, sys_pidfd_open)
+ #define __NR_clone3 435
+ __SYSCALL(__NR_clone3, sys_clone3)
+ #endif
++#define __NR_init_badger_trap 440
++__SYSCALL(__NR_init_badger_trap, sys_init_badger_trap)
+
+ #undef __NR_syscalls
+-#define __NR_syscalls 436
++#define __NR_syscalls 441

@@ -1,0 +1,1116 @@
+diff --git a/mm/memory.c b/mm/memory.c
+index 45442d9a4f52..ab453be3d635 100644
+--- a/mm/memory.c
++++ b/mm/memory.c
+@@ -71,6 +71,11 @@
+ #include <linux/dax.h>
+ #include <linux/oom.h>
+ #include <linux/numa.h>
++#include <linux/mm_econ.h>
++#include <linux/mm_stats.h>
++#include <linux/proc_fs.h>
++#include <linux/memory.h>
++#include <linux/badger_trap.h>
+ 
+ #include <trace/events/kmem.h>
+ 
+@@ -107,6 +112,80 @@ EXPORT_SYMBOL(mem_map);
+ void *high_memory;
+ EXPORT_SYMBOL(high_memory);
+ 
++static unsigned long dump_mapping;
++static struct proc_dir_entry *dump_mapping_ent;
++
++static ssize_t dump_mapping_read_cb(
++		struct file *file, char __user *ubuf,
++		size_t count, loff_t *ppos)
++{
++	char buf[100];
++	int len=0;
++	unsigned long pfn = 0;
++	struct page *page = NULL;
++	bool is_huge = false;
++
++	if(*ppos > 0)
++		return 0;
++
++	get_page_mapping(dump_mapping, &pfn, &page, &is_huge);
++
++	if (page) {
++		len += sprintf(buf, "0x%lx pfn=0x%lx sp=%p %s\n",
++				dump_mapping, pfn, page, is_huge ? "huge" : "base");
++	} else {
++		len += sprintf(buf, "0x%lx is not mapped\n", dump_mapping);
++	}
++
++	if(count < len)
++		return 0;
++
++	if(copy_to_user(ubuf, buf, len))
++		return -EFAULT;
++
++	*ppos = len;
++	return len;
++}
++
++static ssize_t dump_mapping_write_cb(
++		struct file *file, const char __user *ubuf,
++		size_t len, loff_t *offset)
++{
++	int num;
++	unsigned long val;
++	char input[20];
++
++	if(*offset > 0 || len > 20) {
++		return -EFAULT;
++	}
++
++	if(copy_from_user(input, ubuf, len)) {
++		return -EFAULT;
++	}
++
++	num = sscanf(input, "%lx", &val);
++	if(num != 1) {
++		return -EINVAL;
++	}
++
++	dump_mapping = val;
++
++	pr_warn("dump_mapping: 0x%lx\n", dump_mapping);
++
++	return len;
++}
++
++static struct file_operations dump_mapping_ops =
++{
++	.write = dump_mapping_write_cb,
++	.read = dump_mapping_read_cb,
++};
++
++void init_dump_mapping(void)
++{
++    dump_mapping_ent = proc_create("dump_mapping", 0444, NULL, &dump_mapping_ops);
++}
++
+ /*
+  * Randomize the address space (stacks, mmaps, brk, etc.).
+  *
+@@ -592,7 +671,13 @@ static void print_bad_pte(struct vm_area_struct *vma, unsigned long addr,
+ struct page *vm_normal_page(struct vm_area_struct *vma, unsigned long addr,
+ 			    pte_t pte)
+ {
+-	unsigned long pfn = pte_pfn(pte);
++	unsigned long pfn;
++
++	if (vma->vm_mm && vma->vm_mm->badger_trap_was_enabled
++		&& is_pte_reserved(pte))
++	    pte = pte_unreserve(pte);
++
++	pfn = pte_pfn(pte);
+ 
+ 	if (IS_ENABLED(CONFIG_ARCH_HAS_PTE_SPECIAL)) {
+ 		if (likely(!pte_special(pte)))
+@@ -606,6 +691,7 @@ struct page *vm_normal_page(struct vm_area_struct *vma, unsigned long addr,
+ 		if (pte_devmap(pte))
+ 			return NULL;
+ 
++		pr_warn("Bad PTE: marked special unexpectedly\n");
+ 		print_bad_pte(vma, addr, pte, NULL);
+ 		return NULL;
+ 	}
+@@ -632,6 +718,8 @@ struct page *vm_normal_page(struct vm_area_struct *vma, unsigned long addr,
+ 
+ check_pfn:
+ 	if (unlikely(pfn > highest_memmap_pfn)) {
++		pr_warn("Bad PTE: PFN is too high! %lx > %lx\n",
++			pfn, highest_memmap_pfn);
+ 		print_bad_pte(vma, addr, pte, NULL);
+ 		return NULL;
+ 	}
+@@ -1040,7 +1128,16 @@ static unsigned long zap_pte_range(struct mmu_gather *tlb,
+ 	flush_tlb_batched_pending(mm);
+ 	arch_enter_lazy_mmu_mode();
+ 	do {
+-		pte_t ptent = *pte;
++		pte_t ptent;
++
++		if (vma->vm_mm && vma->vm_mm->badger_trap_was_enabled
++			&& is_pte_reserved(ptent))
++		{
++			*pte = pte_unreserve(*pte);
++		}
++
++		ptent = *pte;
++
+ 		if (pte_none(ptent))
+ 			continue;
+ 
+@@ -1078,8 +1175,9 @@ static unsigned long zap_pte_range(struct mmu_gather *tlb,
+ 			}
+ 			rss[mm_counter(page)]--;
+ 			page_remove_rmap(page, false);
+-			if (unlikely(page_mapcount(page) < 0))
++			if (unlikely(page_mapcount(page) < 0)) {
+ 				print_bad_pte(vma, addr, ptent, page);
++			}
+ 			if (unlikely(__tlb_remove_page(tlb, page))) {
+ 				force_flush = 1;
+ 				addr += PAGE_SIZE;
+@@ -1122,8 +1220,9 @@ static unsigned long zap_pte_range(struct mmu_gather *tlb,
+ 			page = migration_entry_to_page(entry);
+ 			rss[mm_counter(page)]--;
+ 		}
+-		if (unlikely(!free_swap_and_cache(entry)))
++		if (unlikely(!free_swap_and_cache(entry))) {
+ 			print_bad_pte(vma, addr, ptent, NULL);
++		}
+ 		pte_clear_not_present_full(mm, addr, pte, tlb->fullmm);
+ 	} while (pte++, addr += PAGE_SIZE, addr != end);
+ 
+@@ -2438,7 +2537,8 @@ static inline void wp_page_reuse(struct vm_fault *vmf)
+  *   held to the old page, as well as updating the rmap.
+  * - In any case, unlock the PTL and drop the reference we took to the old page.
+  */
+-static vm_fault_t wp_page_copy(struct vm_fault *vmf)
++static vm_fault_t wp_page_copy(struct vm_fault *vmf,
++			       struct mm_stats_pftrace *pftrace)
+ {
+ 	struct vm_area_struct *vma = vmf->vma;
+ 	struct mm_struct *mm = vma->vm_mm;
+@@ -2453,13 +2553,21 @@ static vm_fault_t wp_page_copy(struct vm_fault *vmf)
+ 		goto oom;
+ 
+ 	if (is_zero_pfn(pte_pfn(vmf->orig_pte))) {
++		pftrace->alloc_start_tsc = rdtsc();
+ 		new_page = alloc_zeroed_user_highpage_movable(vma,
+ 							      vmf->address);
++		pftrace->alloc_end_tsc = rdtsc();
++		mm_stats_check_alloc_fallback(pftrace);
++		mm_stats_check_alloc_zeroing(pftrace);
+ 		if (!new_page)
+ 			goto oom;
+ 	} else {
++		pftrace->alloc_start_tsc = rdtsc();
+ 		new_page = alloc_page_vma(GFP_HIGHUSER_MOVABLE, vma,
+ 				vmf->address);
++		pftrace->alloc_end_tsc = rdtsc();
++		mm_stats_check_alloc_fallback(pftrace);
++		mm_stats_check_alloc_zeroing(pftrace);
+ 		if (!new_page)
+ 			goto oom;
+ 
+@@ -2504,6 +2612,14 @@ static vm_fault_t wp_page_copy(struct vm_fault *vmf)
+ 		flush_cache_page(vma, vmf->address, pte_pfn(vmf->orig_pte));
+ 		entry = mk_pte(new_page, vma->vm_page_prot);
+ 		entry = maybe_mkwrite(pte_mkdirty(entry), vma);
++
++		/* Make the page table entry as reserved for TLB miss tracking */
++		if(is_badger_trap_enabled(mm, vmf->address)
++			&& !(vmf->flags & FAULT_FLAG_INSTRUCTION))
++		{
++			entry = pte_mkreserve(entry);
++		}
++
+ 		/*
+ 		 * Clear the pte entry and flush it first, before updating the
+ 		 * pte with the new entry. This will avoid a race condition
+@@ -2692,7 +2808,8 @@ static vm_fault_t wp_page_shared(struct vm_fault *vmf)
+  * but allow concurrent faults), with pte both mapped and locked.
+  * We return with mmap_sem still held, but pte unmapped and unlocked.
+  */
+-static vm_fault_t do_wp_page(struct vm_fault *vmf)
++static vm_fault_t do_wp_page(struct vm_fault *vmf,
++			     struct mm_stats_pftrace *pftrace)
+ 	__releases(vmf->ptl)
+ {
+ 	struct vm_area_struct *vma = vmf->vma;
+@@ -2711,7 +2828,7 @@ static vm_fault_t do_wp_page(struct vm_fault *vmf)
+ 			return wp_pfn_shared(vmf);
+ 
+ 		pte_unmap_unlock(vmf->pte, vmf->ptl);
+-		return wp_page_copy(vmf);
++		return wp_page_copy(vmf, pftrace);
+ 	}
+ 
+ 	/*
+@@ -2773,7 +2890,7 @@ static vm_fault_t do_wp_page(struct vm_fault *vmf)
+ 	get_page(vmf->page);
+ 
+ 	pte_unmap_unlock(vmf->pte, vmf->ptl);
+-	return wp_page_copy(vmf);
++	return wp_page_copy(vmf, pftrace);
+ }
+ 
+ static void unmap_mapping_range_vma(struct vm_area_struct *vma,
+@@ -2880,7 +2997,8 @@ EXPORT_SYMBOL(unmap_mapping_range);
+  * We return with the mmap_sem locked or unlocked in the same cases
+  * as does filemap_fault().
+  */
+-vm_fault_t do_swap_page(struct vm_fault *vmf)
++vm_fault_t do_swap_page(struct vm_fault *vmf,
++			struct mm_stats_pftrace *pftrace)
+ {
+ 	struct vm_area_struct *vma = vmf->vma;
+ 	struct page *page = NULL, *swapcache;
+@@ -3030,6 +3148,17 @@ vm_fault_t do_swap_page(struct vm_fault *vmf)
+ 	flush_icache_page(vma, page);
+ 	if (pte_swp_soft_dirty(vmf->orig_pte))
+ 		pte = pte_mksoft_dirty(pte);
++
++	/* Make the page table entry as reserved for TLB miss tracking */
++	if(is_badger_trap_enabled(vma->vm_mm, vmf->address)
++		&& !(vmf->flags & FAULT_FLAG_INSTRUCTION))
++	{
++		// TODO markm: currently only handle anon memory
++		if (vma_is_anonymous(vma)) {
++			// pte = pte_mkreserve(pte); // TODO markm uncomment -- this one seems to cause a panic/pt corruption somehow
++		}
++	}
++
+ 	set_pte_at(vma->vm_mm, vmf->address, vmf->pte, pte);
+ 	arch_do_swap_page(vma->vm_mm, vma, vmf->address, pte, vmf->orig_pte);
+ 	vmf->orig_pte = pte;
+@@ -3064,7 +3193,7 @@ vm_fault_t do_swap_page(struct vm_fault *vmf)
+ 	}
+ 
+ 	if (vmf->flags & FAULT_FLAG_WRITE) {
+-		ret |= do_wp_page(vmf);
++		ret |= do_wp_page(vmf, pftrace);
+ 		if (ret & VM_FAULT_ERROR)
+ 			ret &= VM_FAULT_ERROR;
+ 		goto out;
+@@ -3095,7 +3224,8 @@ vm_fault_t do_swap_page(struct vm_fault *vmf)
+  * but allow concurrent faults), and pte mapped but not yet locked.
+  * We return with mmap_sem still held, but pte unmapped and unlocked.
+  */
+-static vm_fault_t do_anonymous_page(struct vm_fault *vmf)
++static vm_fault_t do_anonymous_page(struct vm_fault *vmf,
++				    struct mm_stats_pftrace *pftrace)
+ {
+ 	struct vm_area_struct *vma = vmf->vma;
+ 	struct mem_cgroup *memcg;
+@@ -3127,6 +3257,7 @@ static vm_fault_t do_anonymous_page(struct vm_fault *vmf)
+ 	/* Use the zero-page for reads */
+ 	if (!(vmf->flags & FAULT_FLAG_WRITE) &&
+ 			!mm_forbids_zeropage(vma->vm_mm)) {
++		mm_stats_set_flag(pftrace, MM_STATS_PF_ZERO);
+ 		entry = pte_mkspecial(pfn_pte(my_zero_pfn(vmf->address),
+ 						vma->vm_page_prot));
+ 		vmf->pte = pte_offset_map_lock(vma->vm_mm, vmf->pmd,
+@@ -3147,7 +3278,11 @@ static vm_fault_t do_anonymous_page(struct vm_fault *vmf)
+ 	/* Allocate our own private page. */
+ 	if (unlikely(anon_vma_prepare(vma)))
+ 		goto oom;
++	pftrace->alloc_start_tsc = rdtsc();
+ 	page = alloc_zeroed_user_highpage_movable(vma, vmf->address);
++	pftrace->alloc_end_tsc = rdtsc();
++	mm_stats_check_alloc_fallback(pftrace);
++	mm_stats_check_alloc_zeroing(pftrace);
+ 	if (!page)
+ 		goto oom;
+ 
+@@ -3188,6 +3323,13 @@ static vm_fault_t do_anonymous_page(struct vm_fault *vmf)
+ 	mem_cgroup_commit_charge(page, memcg, false, false);
+ 	lru_cache_add_active_or_unevictable(page, vma);
+ setpte:
++	/* Make the page table entry as reserved for TLB miss tracking */
++	if(is_badger_trap_enabled(vma->vm_mm, vmf->address)
++		&& !(vmf->flags & FAULT_FLAG_INSTRUCTION))
++	{
++		entry = pte_mkreserve(entry);
++	}
++
+ 	set_pte_at(vma->vm_mm, vmf->address, vmf->pte, entry);
+ 
+ 	/* No need to invalidate - it was non-present before */
+@@ -3454,6 +3596,14 @@ vm_fault_t alloc_set_pte(struct vm_fault *vmf, struct mem_cgroup *memcg,
+ 		inc_mm_counter_fast(vma->vm_mm, mm_counter_file(page));
+ 		page_add_file_rmap(page, false);
+ 	}
++
++	/* Make the page table entry as reserved for TLB miss tracking */
++	if(is_badger_trap_enabled(vma->vm_mm, vmf->address)
++		&& !(vmf->flags & FAULT_FLAG_INSTRUCTION))
++	{
++		entry = pte_mkreserve(entry);
++	}
++
+ 	set_pte_at(vma->vm_mm, vmf->address, vmf->pte, entry);
+ 
+ 	/* no need to invalidate: a not-present page won't be cached */
+@@ -3534,6 +3684,7 @@ static int __init fault_around_debugfs(void)
+ {
+ 	debugfs_create_file_unsafe("fault_around_bytes", 0644, NULL, NULL,
+ 				   &fault_around_bytes_fops);
++	init_dump_mapping();
+ 	return 0;
+ }
+ late_initcall(fault_around_debugfs);
+@@ -3618,11 +3769,13 @@ static vm_fault_t do_fault_around(struct vm_fault *vmf)
+ 	return ret;
+ }
+ 
+-static vm_fault_t do_read_fault(struct vm_fault *vmf)
++static vm_fault_t do_read_fault(struct vm_fault *vmf, struct mm_stats_pftrace *pftrace)
+ {
+ 	struct vm_area_struct *vma = vmf->vma;
+ 	vm_fault_t ret = 0;
+ 
++	mm_stats_set_flag(pftrace, MM_STATS_PF_NOT_ANON_READ);
++
+ 	/*
+ 	 * Let's call ->map_pages() first and use ->fault() as fallback
+ 	 * if page by the offset is not ready to be mapped (cold cache or
+@@ -3645,15 +3798,21 @@ static vm_fault_t do_read_fault(struct vm_fault *vmf)
+ 	return ret;
+ }
+ 
+-static vm_fault_t do_cow_fault(struct vm_fault *vmf)
++static vm_fault_t do_cow_fault(struct vm_fault *vmf, struct mm_stats_pftrace *pftrace)
+ {
+ 	struct vm_area_struct *vma = vmf->vma;
+ 	vm_fault_t ret;
+ 
++	mm_stats_set_flag(pftrace, MM_STATS_PF_NOT_ANON_COW);
++
+ 	if (unlikely(anon_vma_prepare(vma)))
+ 		return VM_FAULT_OOM;
+ 
++	pftrace->alloc_start_tsc = rdtsc();
+ 	vmf->cow_page = alloc_page_vma(GFP_HIGHUSER_MOVABLE, vma, vmf->address);
++	pftrace->alloc_end_tsc = rdtsc();
++	mm_stats_check_alloc_fallback(pftrace);
++	mm_stats_check_alloc_zeroing(pftrace);
+ 	if (!vmf->cow_page)
+ 		return VM_FAULT_OOM;
+ 
+@@ -3669,8 +3828,10 @@ static vm_fault_t do_cow_fault(struct vm_fault *vmf)
+ 	if (ret & VM_FAULT_DONE_COW)
+ 		return ret;
+ 
++	pftrace->prep_start_tsc = rdtsc();
+ 	copy_user_highpage(vmf->cow_page, vmf->page, vmf->address, vma);
+ 	__SetPageUptodate(vmf->cow_page);
++	pftrace->prep_end_tsc = rdtsc();
+ 
+ 	ret |= finish_fault(vmf);
+ 	unlock_page(vmf->page);
+@@ -3684,11 +3845,13 @@ static vm_fault_t do_cow_fault(struct vm_fault *vmf)
+ 	return ret;
+ }
+ 
+-static vm_fault_t do_shared_fault(struct vm_fault *vmf)
++static vm_fault_t do_shared_fault(struct vm_fault *vmf, struct mm_stats_pftrace *pftrace)
+ {
+ 	struct vm_area_struct *vma = vmf->vma;
+ 	vm_fault_t ret, tmp;
+ 
++	mm_stats_set_flag(pftrace, MM_STATS_PF_NOT_ANON_SHARED);
++
+ 	ret = __do_fault(vmf);
+ 	if (unlikely(ret & (VM_FAULT_ERROR | VM_FAULT_NOPAGE | VM_FAULT_RETRY)))
+ 		return ret;
+@@ -3727,7 +3890,7 @@ static vm_fault_t do_shared_fault(struct vm_fault *vmf)
+  * If mmap_sem is released, vma may become invalid (for example
+  * by other thread calling munmap()).
+  */
+-static vm_fault_t do_fault(struct vm_fault *vmf)
++static vm_fault_t do_fault(struct vm_fault *vmf, struct mm_stats_pftrace *pftrace)
+ {
+ 	struct vm_area_struct *vma = vmf->vma;
+ 	struct mm_struct *vm_mm = vma->vm_mm;
+@@ -3763,11 +3926,11 @@ static vm_fault_t do_fault(struct vm_fault *vmf)
+ 			pte_unmap_unlock(vmf->pte, vmf->ptl);
+ 		}
+ 	} else if (!(vmf->flags & FAULT_FLAG_WRITE))
+-		ret = do_read_fault(vmf);
++		ret = do_read_fault(vmf, pftrace);
+ 	else if (!(vma->vm_flags & VM_SHARED))
+-		ret = do_cow_fault(vmf);
++		ret = do_cow_fault(vmf, pftrace);
+ 	else
+-		ret = do_shared_fault(vmf);
++		ret = do_shared_fault(vmf, pftrace);
+ 
+ 	/* preallocated pagetable is unused: free it */
+ 	if (vmf->prealloc_pte) {
+@@ -3882,26 +4045,30 @@ static vm_fault_t do_numa_page(struct vm_fault *vmf)
+ 	return 0;
+ }
+ 
+-static inline vm_fault_t create_huge_pmd(struct vm_fault *vmf)
++static inline vm_fault_t create_huge_pmd(struct vm_fault *vmf,
++					 struct mm_stats_pftrace *pftrace,
++					 bool require_prezeroed)
+ {
+ 	if (vma_is_anonymous(vmf->vma))
+-		return do_huge_pmd_anonymous_page(vmf);
++		return do_huge_pmd_anonymous_page(vmf, pftrace, require_prezeroed);
+ 	if (vmf->vma->vm_ops->huge_fault)
+ 		return vmf->vma->vm_ops->huge_fault(vmf, PE_SIZE_PMD);
+ 	return VM_FAULT_FALLBACK;
+ }
+ 
+ /* `inline' is required to avoid gcc 4.1.2 build error */
+-static inline vm_fault_t wp_huge_pmd(struct vm_fault *vmf, pmd_t orig_pmd)
++static inline vm_fault_t wp_huge_pmd(struct vm_fault *vmf, pmd_t orig_pmd,
++				     struct mm_stats_pftrace *pftrace)
+ {
+ 	if (vma_is_anonymous(vmf->vma))
+-		return do_huge_pmd_wp_page(vmf, orig_pmd);
++		return do_huge_pmd_wp_page(vmf, orig_pmd, pftrace);
+ 	if (vmf->vma->vm_ops->huge_fault)
+ 		return vmf->vma->vm_ops->huge_fault(vmf, PE_SIZE_PMD);
+ 
+ 	/* COW handled on pte level: split pmd */
+ 	VM_BUG_ON_VMA(vmf->vma->vm_flags & VM_SHARED, vmf->vma);
+ 	__split_huge_pmd(vmf->vma, vmf->pmd, vmf->address, false, NULL);
++	mm_stats_set_flag(pftrace, MM_STATS_PF_HUGE_SPLIT);
+ 
+ 	return VM_FAULT_FALLBACK;
+ }
+@@ -3935,6 +4102,76 @@ static vm_fault_t wp_huge_pud(struct vm_fault *vmf, pud_t orig_pud)
+ 	return VM_FAULT_FALLBACK;
+ }
+ 
++/*
++ * This function handles the fake page fault introduced to perform TLB miss
++ * studies. We can perform our work in this fuction on the page table entries.
++ */
++static int do_fake_page_fault(struct mm_struct *mm, struct vm_area_struct *vma,
++		unsigned long address, pte_t *page_table, pmd_t *pmd,
++		unsigned int flags, spinlock_t *ptl)
++{
++        unsigned long *touch_page_addr;
++        unsigned long touched;
++	unsigned long ret;
++	/*
++	static unsigned int consecutive = 0;
++	static unsigned long prev_address = 0;
++
++	if(address == prev_address)
++		consecutive++;
++	else
++	{
++		consecutive = 0;
++		prev_address = address;
++	}
++
++	if(consecutive > 1)
++	{
++		*page_table = pte_unreserve(*page_table);
++		pte_unmap_unlock(page_table, ptl);
++		return 0;
++	}
++	*/
++
++	if(flags & FAULT_FLAG_WRITE)
++		*page_table = pte_mkdirty(*page_table);
++
++	*page_table = pte_mkyoung(*page_table);
++	*page_table = pte_unreserve(*page_table);
++
++	pte_unmap_unlock(page_table, ptl);
++
++	touch_page_addr = (void *)(address & PAGE_MASK);
++	ret = copy_from_user(&touched,
++		(__force const void __user *)touch_page_addr,
++		sizeof(unsigned long));
++
++	if(ret) {
++		return VM_FAULT_SIGBUS;
++	}
++
++	/* Here where we do all our analysis */
++	if (flags & FAULT_FLAG_WRITE)
++	    atomic64_inc(&mm->bt_stats->total_dtlb_4kb_store_misses);
++	else
++	    atomic64_inc(&mm->bt_stats->total_dtlb_4kb_load_misses);
++
++	/*
++	if (vma) {
++	    if (flags & FAULT_FLAG_WRITE)
++		vma->bt_stats.total_dtlb_4kb_store_misses++;
++	    else
++		vma->bt_stats.total_dtlb_4kb_load_misses++;
++	}
++	*/
++
++	pte_offset_map_lock(mm, pmd, address, &ptl);
++	*page_table = pte_mkreserve(*page_table);
++	pte_unmap_unlock(page_table, ptl);
++
++	return 0;
++}
++
+ /*
+  * These routines also need to handle stuff like marking pages dirty
+  * and/or accessed for architectures that don't do it in hardware (most
+@@ -3950,9 +4187,101 @@ static vm_fault_t wp_huge_pud(struct vm_fault *vmf, pud_t orig_pud)
+  * The mmap_sem may have been released depending on flags and our return value.
+  * See filemap_fault() and __lock_page_or_retry().
+  */
+-static vm_fault_t handle_pte_fault(struct vm_fault *vmf)
++static vm_fault_t handle_pte_fault(struct vm_fault *vmf,
++				   struct mm_stats_pftrace *pftrace)
+ {
+ 	pte_t entry;
++	vm_fault_t ret;
++
++	if (vmf->vma->vm_mm && vmf->vma->vm_mm->badger_trap_was_enabled)
++	{
++	    /*
++	     * I'm not sure when this would happen, but just in case: if we ever
++	     * encounter a page reserved (by badger trap) when we have taken an
++	     * instruction fault, unreserve it. I think maybe this can happen for
++	     * JIT-compiled languages where code might be allocated and run off of
++	     * the heap (markm).
++	     */
++	    if((vmf->flags & FAULT_FLAG_INSTRUCTION)
++		    || !is_badger_trap_enabled(vmf->vma->vm_mm, vmf->address))
++	    {
++		    vmf->pte = pte_offset_map(vmf->pmd, vmf->address);
++		    if (vmf->pte) {
++			vmf->ptl = pte_lockptr(vmf->vma->vm_mm, vmf->pmd);
++			spin_lock(vmf->ptl);
++			if (is_pte_reserved(*vmf->pte))
++				*vmf->pte = pte_unreserve(*vmf->pte);
++			spin_unlock(vmf->ptl);
++		    }
++		    pte_unmap(vmf->pte);
++	    }
++
++	    /* We need to figure out if the page fault is a fake page fault or not.
++	     * If it is a fake page fault, we need to handle it specially. It has to
++	     * be made sure that the special page fault is not on instruction fault.
++	     * Our technique cannot not handle instruction page fault yet.
++	     *
++	     * We can have two cases when we have a fake page fault:
++	     * 1. We have taken a fake page fault on a COW page. A
++	     * 	fake page fault on a COW page if for reading only
++	     * 	has to be considered a normal fake page fault. But
++	     * 	for writing purposes need to be handled correctly.
++	     * 2. We have taken a fake page fault on a normal page.
++	     */
++	    if(!(vmf->flags & FAULT_FLAG_INSTRUCTION)
++		    && likely(!pmd_none(*vmf->pmd))
++		    && (vmf->pte = pte_offset_map(vmf->pmd, vmf->address)) // NOTE: assignment + side_effects
++		    && pte_present(*vmf->pte))
++	    {
++		entry = *vmf->pte;
++
++		if (is_pte_reserved(entry) && !pte_protnone(entry))
++		{
++		    if((vmf->flags & FAULT_FLAG_WRITE)
++			    && !pte_write(entry))
++		    {
++			mm_stats_set_flag(pftrace, MM_STATS_PF_WP);
++
++			// We want to do this here because we want
++			// do_wp_page not to see the magical reserved bit.
++			vmf->ptl = pte_lockptr(vmf->vma->vm_mm, vmf->pmd);
++			spin_lock(vmf->ptl);
++			*vmf->pte = pte_unreserve(*vmf->pte);
++			vmf->orig_pte = *vmf->pte;
++
++			ret = do_wp_page(vmf, pftrace);
++			// Returns with pte unmapped, unlocked.
++
++			pte_offset_map_lock(vmf->vma->vm_mm, vmf->pmd, vmf->address, &vmf->ptl);
++			if (pte_present(*vmf->pte))
++			    *vmf->pte = pte_mkreserve(*vmf->pte);
++			pte_unmap_unlock(vmf->pte, vmf->ptl);
++
++			return ret;
++		    }
++		    else
++		    {
++			mm_stats_set_flag(pftrace, MM_STATS_PF_BADGER_TRAP);
++			vmf->ptl = pte_lockptr(vmf->vma->vm_mm, vmf->pmd);
++			spin_lock(vmf->ptl);
++			return do_fake_page_fault(vmf->vma->vm_mm, vmf->vma,
++				vmf->address, vmf->pte, vmf->pmd,
++				vmf->flags, vmf->ptl);
++		    }
++		}
++
++		vmf->ptl = pte_lockptr(vmf->vma->vm_mm, vmf->pmd);
++		spin_lock(vmf->ptl);
++		if (is_badger_trap_enabled(vmf->vma->vm_mm, vmf->address)
++			&& !pte_protnone(*vmf->pte))
++		{
++		    *vmf->pte = pte_mkreserve(*vmf->pte);
++		} else {
++		    *vmf->pte = pte_unreserve(*vmf->pte);
++		}
++		pte_unmap_unlock(vmf->pte, vmf->ptl);
++	    }
++	}
+ 
+ 	if (unlikely(pmd_none(*vmf->pmd))) {
+ 		/*
+@@ -3992,16 +4321,22 @@ static vm_fault_t handle_pte_fault(struct vm_fault *vmf)
+ 
+ 	if (!vmf->pte) {
+ 		if (vma_is_anonymous(vmf->vma))
+-			return do_anonymous_page(vmf);
+-		else
+-			return do_fault(vmf);
++			return do_anonymous_page(vmf, pftrace);
++		else {
++			mm_stats_set_flag(pftrace, MM_STATS_PF_NOT_ANON);
++			return do_fault(vmf, pftrace);
++		}
+ 	}
+ 
+-	if (!pte_present(vmf->orig_pte))
+-		return do_swap_page(vmf);
++	if (!pte_present(vmf->orig_pte)) {
++		mm_stats_set_flag(pftrace, MM_STATS_PF_SWAP);
++		return do_swap_page(vmf, pftrace);
++	}
+ 
+-	if (pte_protnone(vmf->orig_pte) && vma_is_accessible(vmf->vma))
++	if (pte_protnone(vmf->orig_pte) && vma_is_accessible(vmf->vma)) {
++		mm_stats_set_flag(pftrace, MM_STATS_PF_NUMA);
+ 		return do_numa_page(vmf);
++	}
+ 
+ 	vmf->ptl = pte_lockptr(vmf->vma->vm_mm, vmf->pmd);
+ 	spin_lock(vmf->ptl);
+@@ -4009,8 +4344,10 @@ static vm_fault_t handle_pte_fault(struct vm_fault *vmf)
+ 	if (unlikely(!pte_same(*vmf->pte, entry)))
+ 		goto unlock;
+ 	if (vmf->flags & FAULT_FLAG_WRITE) {
+-		if (!pte_write(entry))
+-			return do_wp_page(vmf);
++		if (!pte_write(entry)) {
++			mm_stats_set_flag(pftrace, MM_STATS_PF_WP);
++			return do_wp_page(vmf, pftrace);
++		}
+ 		entry = pte_mkdirty(entry);
+ 	}
+ 	entry = pte_mkyoung(entry);
+@@ -4027,11 +4364,69 @@ static vm_fault_t handle_pte_fault(struct vm_fault *vmf)
+ 		if (vmf->flags & FAULT_FLAG_WRITE)
+ 			flush_tlb_fix_spurious_fault(vmf->vma, vmf->address);
+ 	}
++
+ unlock:
+ 	pte_unmap_unlock(vmf->pte, vmf->ptl);
+ 	return 0;
+ }
+ 
++static int transparent_fake_fault(struct vm_fault *vmf)
++{
++        unsigned long *touch_page_addr;
++        unsigned long touched;
++        unsigned long ret;
++	/*
++        static unsigned int consecutive = 0;
++        static unsigned long prev_address = 0;
++
++        if(vmf->address == prev_address)
++                consecutive++;
++        else
++        {
++                consecutive = 0;
++                prev_address = vmf->address;
++        }
++
++        if(consecutive > 1)
++        {
++                *vmf->pmd = pmd_unreserve(*vmf->pmd);
++                return 0;
++        }
++	*/
++
++        if(vmf->flags & FAULT_FLAG_WRITE)
++                *vmf->pmd = pmd_mkdirty(*vmf->pmd);
++
++        *vmf->pmd = pmd_mkyoung(*vmf->pmd);
++        *vmf->pmd = pmd_unreserve(*vmf->pmd);
++
++        touch_page_addr = (void *)(vmf->address & PAGE_MASK);
++        ret = copy_from_user(&touched,
++		(__force const void __user *)touch_page_addr,
++		sizeof(unsigned long));
++
++        if(ret)
++                return VM_FAULT_SIGBUS;
++
++        /* Here where we do all our analysis */
++	if (vmf->flags & FAULT_FLAG_WRITE)
++	    atomic64_inc(&vmf->vma->vm_mm->bt_stats->total_dtlb_2mb_store_misses);
++	else
++	    atomic64_inc(&vmf->vma->vm_mm->bt_stats->total_dtlb_2mb_load_misses);
++
++	/*
++	if (vmf->vma) {
++	    if (vmf->flags & FAULT_FLAG_WRITE)
++		vmf->vma->bt_stats.total_dtlb_2mb_store_misses++;
++	    else
++		vmf->vma->bt_stats.total_dtlb_2mb_load_misses++;
++	}
++	*/
++
++        *vmf->pmd = pmd_mkreserve(*vmf->pmd);
++        return 0;
++}
++
+ /*
+  * By the time we get here, we already hold the mm semaphore
+  *
+@@ -4039,7 +4434,8 @@ static vm_fault_t handle_pte_fault(struct vm_fault *vmf)
+  * return value.  See filemap_fault() and __lock_page_or_retry().
+  */
+ static vm_fault_t __handle_mm_fault(struct vm_area_struct *vma,
+-		unsigned long address, unsigned int flags)
++		unsigned long address, unsigned int flags,
++		struct mm_stats_pftrace *pftrace)
+ {
+ 	struct vm_fault vmf = {
+ 		.vma = vma,
+@@ -4052,22 +4448,89 @@ static vm_fault_t __handle_mm_fault(struct vm_area_struct *vma,
+ 	struct mm_struct *mm = vma->vm_mm;
+ 	pgd_t *pgd;
+ 	p4d_t *p4d;
++	spinlock_t *ptl;
+ 	vm_fault_t ret;
++	struct mm_cost_delta mm_cost_delta;
++	struct mm_action mm_action;
++	bool should_do;
++
++	// (markm) cr3->pgd->p4d->pud->pmd->pt->page
+ 
+ 	pgd = pgd_offset(mm, address);
+ 	p4d = p4d_alloc(mm, pgd, address);
+ 	if (!p4d)
+ 		return VM_FAULT_OOM;
+ 
++	vmf.pud = pud_offset(p4d, address);
++
++	/* Check for transparent 1GB huge pages that are marked reserved. */
++	if (mm && mm->badger_trap_was_enabled && !(vmf.flags & FAULT_FLAG_INSTRUCTION)
++		&& vmf.pud && pud_trans_huge(*vmf.pud))
++	{
++	    pud_t orig_pud = *vmf.pud;
++
++	    if ((vmf.flags & FAULT_FLAG_WRITE) && is_pud_reserved(orig_pud)
++		    && !pud_write(orig_pud) && pud_present(orig_pud))
++	    {
++		mm_stats_set_flag(pftrace, MM_STATS_PF_VERY_HUGE_PAGE);
++		mm_stats_set_flag(pftrace, MM_STATS_PF_WP);
++		// NOTE: This is pseudocode... Linux doesn't support
++		// transparent 1GB huge pages yet...
++		//
++		// return do_huge_pud_wp_page();
++		goto escape_pud;
++	    }
++
++	    if (is_pud_reserved(orig_pud) && pud_present(orig_pud))
++	    {
++		mm_stats_set_flag(pftrace, MM_STATS_PF_VERY_HUGE_PAGE);
++		mm_stats_set_flag(pftrace, MM_STATS_PF_BADGER_TRAP);
++		// NOTE: This is pseudocode... Linux doesn't support
++		// transparent 1GB huge pages yet...
++		//
++		// ret = transparent_1gb_fake_fault();
++		// return ret;
++		goto escape_pud;
++	    }
++
++	    ptl = pud_lock(mm, vmf.pud);
++	    // We use the "live" pud here.
++	    if (pud_present(*vmf.pud)
++		    && is_badger_trap_enabled(vmf.vma->vm_mm, vmf.address))
++	    {
++		// *vmf.pud = pud_mkreserve(*vmf.pud); // TODO markm uncomment
++	    } else if (pud_present(*vmf.pud))
++	    {
++		*vmf.pud = pud_unreserve(*vmf.pud);
++	    }
++	    spin_unlock(ptl);
++	}
++
++escape_pud:
+ 	vmf.pud = pud_alloc(mm, p4d, address);
+ 	if (!vmf.pud)
+ 		return VM_FAULT_OOM;
++
+ retry_pud:
+-	if (pud_none(*vmf.pud) && __transparent_hugepage_enabled(vma)) {
+-		ret = create_huge_pud(&vmf);
+-		if (!(ret & VM_FAULT_FALLBACK))
+-			return ret;
++	if (pud_none(*vmf.pud) && __transparent_hugepage_enabled(vma, address)) {
++		// (markm) No entry present.
++
++		// (markm) run the estimator to check if we should create a 1GB page.
++		mm_action.address = address;
++		mm_action.action = MM_ACTION_PROMOTE_HUGE;
++		mm_action.huge_page_order = HPAGE_PUD_SHIFT-PAGE_SHIFT;
++		mm_estimate_changes(&mm_action, &mm_cost_delta);
++		should_do = mm_decide(&mm_cost_delta);
++
++		if (should_do) {
++			ret = create_huge_pud(&vmf);
++			if (!(ret & VM_FAULT_FALLBACK)) {
++				mm_stats_set_flag(pftrace, MM_STATS_PF_VERY_HUGE_PAGE);
++				return ret;
++			}
++		}
+ 	} else {
++		// (markm) Entry is already present.
+ 		pud_t orig_pud = *vmf.pud;
+ 
+ 		barrier();
+@@ -4077,8 +4540,11 @@ static vm_fault_t __handle_mm_fault(struct vm_area_struct *vma,
+ 
+ 			if (dirty && !pud_write(orig_pud)) {
+ 				ret = wp_huge_pud(&vmf, orig_pud);
+-				if (!(ret & VM_FAULT_FALLBACK))
++				if (!(ret & VM_FAULT_FALLBACK)) {
++					mm_stats_set_flag(pftrace, MM_STATS_PF_VERY_HUGE_PAGE);
++					mm_stats_set_flag(pftrace, MM_STATS_PF_WP);
+ 					return ret;
++				}
+ 			} else {
+ 				huge_pud_set_accessed(&vmf, orig_pud);
+ 				return 0;
+@@ -4086,6 +4552,43 @@ static vm_fault_t __handle_mm_fault(struct vm_area_struct *vma,
+ 		}
+ 	}
+ 
++	vmf.pmd = pmd_offset(vmf.pud, address);
++
++        /*
++	 * Here we check for transparent huge page that are marked as reserved
++         */
++        if(mm && mm->badger_trap_was_enabled && !(vmf.flags & FAULT_FLAG_INSTRUCTION)
++		&& vmf.pmd && pmd_trans_huge(*vmf.pmd))
++        {
++                pmd_t orig_pmd = *vmf.pmd;
++
++                if ((vmf.flags & FAULT_FLAG_WRITE) && is_pmd_reserved(orig_pmd)
++			&& !pmd_write(orig_pmd) && pmd_present(orig_pmd))
++                {
++			mm_stats_set_flag(pftrace, MM_STATS_PF_HUGE_PAGE);
++			mm_stats_set_flag(pftrace, MM_STATS_PF_WP);
++			return do_huge_pmd_wp_page(&vmf, orig_pmd, pftrace);
++                }
++                if (is_pmd_reserved(orig_pmd) && pmd_present(orig_pmd))
++                {
++			mm_stats_set_flag(pftrace, MM_STATS_PF_HUGE_PAGE);
++			mm_stats_set_flag(pftrace, MM_STATS_PF_BADGER_TRAP);
++                        ret = transparent_fake_fault(&vmf);
++			return ret;
++                }
++
++		ptl = pmd_lock(mm, vmf.pmd);
++		// We use the "live" pmd here.
++                if (pmd_present(*vmf.pmd)
++			&& is_badger_trap_enabled(vmf.vma->vm_mm, vmf.address))
++		{
++			// *vmf.pmd = pmd_mkreserve(*vmf.pmd); // TODO markm uncomment
++                } else if (pmd_present(*vmf.pmd)) {
++			*vmf.pmd = pmd_unreserve(*vmf.pmd);
++		}
++		spin_unlock(ptl);
++	}
++
+ 	vmf.pmd = pmd_alloc(mm, vmf.pud, address);
+ 	if (!vmf.pmd)
+ 		return VM_FAULT_OOM;
+@@ -4094,27 +4597,45 @@ static vm_fault_t __handle_mm_fault(struct vm_area_struct *vma,
+ 	if (pud_trans_unstable(vmf.pud))
+ 		goto retry_pud;
+ 
+-	if (pmd_none(*vmf.pmd) && __transparent_hugepage_enabled(vma)) {
+-		ret = create_huge_pmd(&vmf);
+-		if (!(ret & VM_FAULT_FALLBACK))
+-			return ret;
++	if (pmd_none(*vmf.pmd) && __transparent_hugepage_enabled(vma, address)) {
++		// (markm) No entry present.
++
++		// (markm) run the estimator to check if we should create a 2MB page.
++		mm_action.address = address;
++		mm_action.action = MM_ACTION_PROMOTE_HUGE;
++		mm_action.huge_page_order = HPAGE_PMD_ORDER;
++		mm_estimate_changes(&mm_action, &mm_cost_delta);
++		should_do = mm_decide(&mm_cost_delta);
++
++		if (should_do) {
++			ret = create_huge_pmd(&vmf, pftrace, mm_cost_delta.extra);
++			if (!(ret & VM_FAULT_FALLBACK))
++				return ret;
++		}
+ 	} else {
++		// (markm) Entry is already present.
++
+ 		pmd_t orig_pmd = *vmf.pmd;
+ 
+ 		barrier();
+ 		if (unlikely(is_swap_pmd(orig_pmd))) {
+ 			VM_BUG_ON(thp_migration_supported() &&
+-					  !is_pmd_migration_entry(orig_pmd));
++					!is_pmd_migration_entry(orig_pmd));
+ 			if (is_pmd_migration_entry(orig_pmd))
+ 				pmd_migration_entry_wait(mm, vmf.pmd);
+ 			return 0;
+ 		}
+ 		if (pmd_trans_huge(orig_pmd) || pmd_devmap(orig_pmd)) {
+-			if (pmd_protnone(orig_pmd) && vma_is_accessible(vma))
++			if (pmd_protnone(orig_pmd) && vma_is_accessible(vma)) {
++				mm_stats_set_flag(pftrace, MM_STATS_PF_NUMA);
+ 				return do_huge_pmd_numa_page(&vmf, orig_pmd);
++			}
+ 
++			// TODO(markm): wp_huge_pmd/pud are for huge COW
++			// faults. Should add mm-econ logic here too.
+ 			if (dirty && !pmd_write(orig_pmd)) {
+-				ret = wp_huge_pmd(&vmf, orig_pmd);
++				ret = wp_huge_pmd(&vmf, orig_pmd, pftrace);
++				mm_stats_set_flag(pftrace, MM_STATS_PF_WP);
+ 				if (!(ret & VM_FAULT_FALLBACK))
+ 					return ret;
+ 			} else {
+@@ -4124,7 +4645,7 @@ static vm_fault_t __handle_mm_fault(struct vm_area_struct *vma,
+ 		}
+ 	}
+ 
+-	return handle_pte_fault(&vmf);
++	return handle_pte_fault(&vmf, pftrace) | VM_FAULT_BASE_PAGE;
+ }
+ 
+ /*
+@@ -4134,7 +4655,7 @@ static vm_fault_t __handle_mm_fault(struct vm_area_struct *vma,
+  * return value.  See filemap_fault() and __lock_page_or_retry().
+  */
+ vm_fault_t handle_mm_fault(struct vm_area_struct *vma, unsigned long address,
+-		unsigned int flags)
++		unsigned int flags, struct mm_stats_pftrace *pftrace)
+ {
+ 	vm_fault_t ret;
+ 
+@@ -4158,10 +4679,20 @@ vm_fault_t handle_mm_fault(struct vm_area_struct *vma, unsigned long address,
+ 	if (flags & FAULT_FLAG_USER)
+ 		mem_cgroup_enter_user_fault();
+ 
++	// If any other thread is in `badger_trap_walk`, we need to wait here.
++	if (vma->vm_mm) {
++		down_read(&vma->vm_mm->badger_trap_page_table_sem);
++	}
++
+ 	if (unlikely(is_vm_hugetlb_page(vma)))
++		// TODO(markm): maybe eventually instrument this with pftrace?
+ 		ret = hugetlb_fault(vma->vm_mm, vma, address, flags);
+ 	else
+-		ret = __handle_mm_fault(vma, address, flags);
++		ret = __handle_mm_fault(vma, address, flags, pftrace);
++
++	if (vma->vm_mm) {
++		up_read(&vma->vm_mm->badger_trap_page_table_sem);
++	}
+ 
+ 	if (flags & FAULT_FLAG_USER) {
+ 		mem_cgroup_exit_user_fault();
+@@ -4614,6 +5145,9 @@ static inline void process_huge_page(
+ 	unsigned long addr = addr_hint &
+ 		~(((unsigned long)pages_per_huge_page << PAGE_SHIFT) - 1);
+ 
++	u64 start = rdtsc();
++	u64 start_single;
++
+ 	/* Process target subpage last to keep its cache lines hot */
+ 	might_sleep();
+ 	n = (addr_hint - addr) / PAGE_SIZE;
+@@ -4624,7 +5158,11 @@ static inline void process_huge_page(
+ 		/* Process subpages at the end of huge page */
+ 		for (i = pages_per_huge_page - 1; i >= 2 * n; i--) {
+ 			cond_resched();
++			start_single = rdtsc();
+ 			process_subpage(addr + i * PAGE_SIZE, i, arg);
++			mm_stats_hist_measure(
++				&mm_process_huge_page_single_page_cycles,
++				rdtsc() - start_single);
+ 		}
+ 	} else {
+ 		/* If target subpage in second half of huge page */
+@@ -4633,7 +5171,11 @@ static inline void process_huge_page(
+ 		/* Process subpages at the begin of huge page */
+ 		for (i = 0; i < base; i++) {
+ 			cond_resched();
++			start_single = rdtsc();
+ 			process_subpage(addr + i * PAGE_SIZE, i, arg);
++			mm_stats_hist_measure(
++				&mm_process_huge_page_single_page_cycles,
++				rdtsc() - start_single);
+ 		}
+ 	}
+ 	/*
+@@ -4645,10 +5187,21 @@ static inline void process_huge_page(
+ 		int right_idx = base + 2 * l - 1 - i;
+ 
+ 		cond_resched();
++		start_single = rdtsc();
+ 		process_subpage(addr + left_idx * PAGE_SIZE, left_idx, arg);
++		mm_stats_hist_measure(
++			&mm_process_huge_page_single_page_cycles,
++			rdtsc() - start_single);
++
+ 		cond_resched();
++		start_single = rdtsc();
+ 		process_subpage(addr + right_idx * PAGE_SIZE, right_idx, arg);
++		mm_stats_hist_measure(
++			&mm_process_huge_page_single_page_cycles,
++			rdtsc() - start_single);
+ 	}
++
++	mm_stats_hist_measure(&mm_process_huge_page_cycles, rdtsc() - start);
+ }
+ 
+ static void clear_gigantic_page(struct page *page,
+@@ -4670,6 +5223,8 @@ static void clear_subpage(unsigned long addr, int idx, void *arg)
+ {
+ 	struct page *page = arg;
+ 
++	if (PageZeroed(page + idx)) return;
++
+ 	clear_user_highpage(page + idx, addr);
+ }
+ 
+@@ -4678,6 +5233,7 @@ void clear_huge_page(struct page *page,
+ {
+ 	unsigned long addr = addr_hint &
+ 		~(((unsigned long)pages_per_huge_page << PAGE_SHIFT) - 1);
++	u64 start = rdtsc();
+ 
+ 	if (unlikely(pages_per_huge_page > MAX_ORDER_NR_PAGES)) {
+ 		clear_gigantic_page(page, addr, pages_per_huge_page);
+@@ -4685,6 +5241,8 @@ void clear_huge_page(struct page *page,
+ 	}
+ 
+ 	process_huge_page(addr_hint, pages_per_huge_page, clear_subpage, page);
++
++	mm_stats_hist_measure(&mm_huge_page_fault_clear_cycles, rdtsc() - start);
+ }
+ 
+ static void copy_user_gigantic_page(struct page *dst, struct page *src,
+@@ -4731,6 +5289,7 @@ void copy_user_huge_page(struct page *dst, struct page *src,
+ 		.src = src,
+ 		.vma = vma,
+ 	};
++	u64 start = rdtsc();
+ 
+ 	if (unlikely(pages_per_huge_page > MAX_ORDER_NR_PAGES)) {
+ 		copy_user_gigantic_page(dst, src, addr, vma,
+@@ -4739,6 +5298,8 @@ void copy_user_huge_page(struct page *dst, struct page *src,
+ 	}
+ 
+ 	process_huge_page(addr_hint, pages_per_huge_page, copy_subpage, &arg);
++
++	mm_stats_hist_measure(&mm_huge_page_fault_cow_copy_huge_cycles, rdtsc() - start);
+ }
+ 
+ long copy_huge_page_from_user(struct page *dst_page,
