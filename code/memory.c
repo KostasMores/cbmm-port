@@ -73,6 +73,10 @@
 #include <linux/perf_event.h>
 #include <linux/ptrace.h>
 #include <linux/vmalloc.h>
+// New
+#include <linux/mm_econ.h>
+#include <linux/mm_stats.h>
+
 
 #include <trace/events/kmem.h>
 
@@ -3003,7 +3007,7 @@ static inline void wp_page_reuse(struct vm_fault *vmf)
  *   held to the old page, as well as updating the rmap.
  * - In any case, unlock the PTL and drop the reference we took to the old page.
  */
-static vm_fault_t wp_page_copy(struct vm_fault *vmf)
+static vm_fault_t wp_page_copy(struct vm_fault *vmf, struct mm_stats_pftrace *pftrace)
 {
 	struct vm_area_struct *vma = vmf->vma;
 	struct mm_struct *mm = vma->vm_mm;
@@ -3018,13 +3022,21 @@ static vm_fault_t wp_page_copy(struct vm_fault *vmf)
 		goto oom;
 
 	if (is_zero_pfn(pte_pfn(vmf->orig_pte))) {
+		pftrace->alloc_start_tsc = rdtsc();
 		new_page = alloc_zeroed_user_highpage_movable(vma,
 							      vmf->address);
+		pftrace->alloc_end_tsc = rdtsc();
+		mm_stats_check_alloc_fallback(pftrace);
+		mm_stats_check_alloc_zeroing(pftrace);
 		if (!new_page)
 			goto oom;
 	} else {
+		pftrace->alloc_start_tsc = rdtsc();
 		new_page = alloc_page_vma(GFP_HIGHUSER_MOVABLE, vma,
 				vmf->address);
+		pftrace->alloc_end_tsc = rdtsc();
+		mm_stats_check_alloc_fallback(pftrace);
+		mm_stats_check_alloc_zeroing(pftrace);
 		if (!new_page)
 			goto oom;
 
@@ -3266,7 +3278,7 @@ static vm_fault_t wp_page_shared(struct vm_fault *vmf)
  * but allow concurrent faults), with pte both mapped and locked.
  * We return with mmap_lock still held, but pte unmapped and unlocked.
  */
-static vm_fault_t do_wp_page(struct vm_fault *vmf)
+static vm_fault_t do_wp_page(struct vm_fault *vmf, struct mm_stats_pftrace *pftrace)
 	__releases(vmf->ptl)
 {
 	struct vm_area_struct *vma = vmf->vma;
@@ -3298,7 +3310,7 @@ static vm_fault_t do_wp_page(struct vm_fault *vmf)
 			return wp_pfn_shared(vmf);
 
 		pte_unmap_unlock(vmf->pte, vmf->ptl);
-		return wp_page_copy(vmf);
+		return wp_page_copy(vmf, pftrace);
 	}
 
 	/*
@@ -3516,7 +3528,7 @@ static vm_fault_t remove_device_exclusive_entry(struct vm_fault *vmf)
  * We return with the mmap_lock locked or unlocked in the same cases
  * as does filemap_fault().
  */
-vm_fault_t do_swap_page(struct vm_fault *vmf)
+vm_fault_t do_swap_page(struct vm_fault *vmf, struct mm_stats_pftrace *pftrace)
 {
 	struct vm_area_struct *vma = vmf->vma;
 	struct page *page = NULL, *swapcache;
@@ -3718,7 +3730,7 @@ vm_fault_t do_swap_page(struct vm_fault *vmf)
 	}
 
 	if (vmf->flags & FAULT_FLAG_WRITE) {
-		ret |= do_wp_page(vmf);
+		ret |= do_wp_page(vmf, pftrace);
 		if (ret & VM_FAULT_ERROR)
 			ret &= VM_FAULT_ERROR;
 		goto out;
@@ -3752,7 +3764,7 @@ out_release:
  * but allow concurrent faults), and pte mapped but not yet locked.
  * We return with mmap_lock still held, but pte unmapped and unlocked.
  */
-static vm_fault_t do_anonymous_page(struct vm_fault *vmf)
+static vm_fault_t do_anonymous_page(struct vm_fault *vmf, struct mm_stats_pftrace *pftrace)
 {
 	struct vm_area_struct *vma = vmf->vma;
 	struct page *page;
@@ -3783,6 +3795,7 @@ static vm_fault_t do_anonymous_page(struct vm_fault *vmf)
 	/* Use the zero-page for reads */
 	if (!(vmf->flags & FAULT_FLAG_WRITE) &&
 			!mm_forbids_zeropage(vma->vm_mm)) {
+		mm_stats_set_flag(pftrace, MM_STATS_PF_ZERO);
 		entry = pte_mkspecial(pfn_pte(my_zero_pfn(vmf->address),
 						vma->vm_page_prot));
 		vmf->pte = pte_offset_map_lock(vma->vm_mm, vmf->pmd,
@@ -3805,7 +3818,11 @@ static vm_fault_t do_anonymous_page(struct vm_fault *vmf)
 	/* Allocate our own private page. */
 	if (unlikely(anon_vma_prepare(vma)))
 		goto oom;
+	pftrace->alloc_start_tsc = rdtsc();
 	page = alloc_zeroed_user_highpage_movable(vma, vmf->address);
+	pftrace->alloc_end_tsc = rdtsc();
+	mm_stats_check_alloc_fallback(pftrace);
+	mm_stats_check_alloc_zeroing(pftrace);
 	if (!page)
 		goto oom;
 
@@ -4213,10 +4230,12 @@ static vm_fault_t do_fault_around(struct vm_fault *vmf)
 	return vmf->vma->vm_ops->map_pages(vmf, start_pgoff, end_pgoff);
 }
 
-static vm_fault_t do_read_fault(struct vm_fault *vmf)
+static vm_fault_t do_read_fault(struct vm_fault *vmf, struct mm_stats_pftrace *pftrace)
 {
 	struct vm_area_struct *vma = vmf->vma;
 	vm_fault_t ret = 0;
+
+	mm_stats_set_flag(pftrace, MM_STATS_PF_NOT_ANON_READ);
 
 	/*
 	 * Let's call ->map_pages() first and use ->fault() as fallback
@@ -4247,10 +4266,16 @@ static vm_fault_t do_cow_fault(struct vm_fault *vmf)
 	struct vm_area_struct *vma = vmf->vma;
 	vm_fault_t ret;
 
+	mm_stats_set_flag(pftrace, MM_STATS_PF_NOT_ANON_COW);
+
 	if (unlikely(anon_vma_prepare(vma)))
 		return VM_FAULT_OOM;
 
+	pftrace->alloc_start_tsc = rdtsc();
 	vmf->cow_page = alloc_page_vma(GFP_HIGHUSER_MOVABLE, vma, vmf->address);
+	pftrace->alloc_end_tsc = rdtsc();
+	mm_stats_check_alloc_fallback(pftrace);
+	mm_stats_check_alloc_zeroing(pftrace);
 	if (!vmf->cow_page)
 		return VM_FAULT_OOM;
 
@@ -4266,8 +4291,10 @@ static vm_fault_t do_cow_fault(struct vm_fault *vmf)
 	if (ret & VM_FAULT_DONE_COW)
 		return ret;
 
+	pftrace->prep_start_tsc = rdtsc();
 	copy_user_highpage(vmf->cow_page, vmf->page, vmf->address, vma);
 	__SetPageUptodate(vmf->cow_page);
+	pftrace->prep_end_tsc = rdtsc();
 
 	ret |= finish_fault(vmf);
 	unlock_page(vmf->page);
@@ -4280,10 +4307,12 @@ uncharge_out:
 	return ret;
 }
 
-static vm_fault_t do_shared_fault(struct vm_fault *vmf)
+static vm_fault_t do_shared_fault(struct vm_fault *vmf, struct mm_stats_pftrace *pftrace)
 {
 	struct vm_area_struct *vma = vmf->vma;
 	vm_fault_t ret, tmp;
+
+	mm_stats_set_flag(pftrace, MM_STATS_PF_NOT_ANON_SHARED);
 
 	ret = __do_fault(vmf);
 	if (unlikely(ret & (VM_FAULT_ERROR | VM_FAULT_NOPAGE | VM_FAULT_RETRY)))
@@ -4323,7 +4352,7 @@ static vm_fault_t do_shared_fault(struct vm_fault *vmf)
  * If mmap_lock is released, vma may become invalid (for example
  * by other thread calling munmap()).
  */
-static vm_fault_t do_fault(struct vm_fault *vmf)
+static vm_fault_t do_fault(struct vm_fault *vmf, struct mm_stats_pftrace *pftrace)
 {
 	struct vm_area_struct *vma = vmf->vma;
 	struct mm_struct *vm_mm = vma->vm_mm;
@@ -4359,11 +4388,11 @@ static vm_fault_t do_fault(struct vm_fault *vmf)
 			pte_unmap_unlock(vmf->pte, vmf->ptl);
 		}
 	} else if (!(vmf->flags & FAULT_FLAG_WRITE))
-		ret = do_read_fault(vmf);
+		ret = do_read_fault(vmf, pftrace);
 	else if (!(vma->vm_flags & VM_SHARED))
-		ret = do_cow_fault(vmf);
+		ret = do_cow_fault(vmf, pftrace);
 	else
-		ret = do_shared_fault(vmf);
+		ret = do_shared_fault(vmf, pftrace);
 
 	/* preallocated pagetable is unused: free it */
 	if (vmf->prealloc_pte) {
@@ -4485,22 +4514,24 @@ out_map:
 	goto out;
 }
 
-static inline vm_fault_t create_huge_pmd(struct vm_fault *vmf)
+static inline vm_fault_t create_huge_pmd(struct vm_fault *vmf, 
+					struct mm_stats_pftrace *pftrace,
+					bool require_prezeroed)
 {
 	if (vma_is_anonymous(vmf->vma))
-		return do_huge_pmd_anonymous_page(vmf);
+		return do_huge_pmd_anonymous_page(vmf, pftrace, require_prezeroed);
 	if (vmf->vma->vm_ops->huge_fault)
 		return vmf->vma->vm_ops->huge_fault(vmf, PE_SIZE_PMD);
 	return VM_FAULT_FALLBACK;
 }
 
 /* `inline' is required to avoid gcc 4.1.2 build error */
-static inline vm_fault_t wp_huge_pmd(struct vm_fault *vmf)
+static inline vm_fault_t wp_huge_pmd(struct vm_fault *vmf, struct mm_stats_pftrace *pftrace)
 {
 	if (vma_is_anonymous(vmf->vma)) {
 		if (userfaultfd_huge_pmd_wp(vmf->vma, vmf->orig_pmd))
 			return handle_userfault(vmf, VM_UFFD_WP);
-		return do_huge_pmd_wp_page(vmf);
+		return do_huge_pmd_wp_page(vmf, pftrace);
 	}
 	if (vmf->vma->vm_ops->huge_fault) {
 		vm_fault_t ret = vmf->vma->vm_ops->huge_fault(vmf, PE_SIZE_PMD);
@@ -4511,6 +4542,7 @@ static inline vm_fault_t wp_huge_pmd(struct vm_fault *vmf)
 
 	/* COW or write-notify handled on pte level: split pmd. */
 	__split_huge_pmd(vmf->vma, vmf->pmd, vmf->address, false, NULL);
+	mm_stats_set_flag(pftrace, MM_STATS_PF_HUGE_SPLIT);
 
 	return VM_FAULT_FALLBACK;
 }
@@ -4563,7 +4595,8 @@ split:
  * The mmap_lock may have been released depending on flags and our return value.
  * See filemap_fault() and __lock_page_or_retry().
  */
-static vm_fault_t handle_pte_fault(struct vm_fault *vmf)
+static vm_fault_t handle_pte_fault(struct vm_fault *vmf,
+				  struct mm_stats_pftrace *pftrace)
 {
 	pte_t entry;
 
@@ -4616,16 +4649,21 @@ static vm_fault_t handle_pte_fault(struct vm_fault *vmf)
 
 	if (!vmf->pte) {
 		if (vma_is_anonymous(vmf->vma))
-			return do_anonymous_page(vmf);
+			return do_anonymous_page(vmf, pftrace);
 		else
-			return do_fault(vmf);
+			mm_stats_set_flag(pftrace, MM_STATS_PF_NOT_ANON);
+			return do_fault(vmf, pftrace);
 	}
 
-	if (!pte_present(vmf->orig_pte))
-		return do_swap_page(vmf);
+	if (!pte_present(vmf->orig_pte)) {
+		mm_stats_set_flag(pftrace, MM_STATS_PF_SWAP);
+		return do_swap_page(vmf, pftrace);
+	}
 
-	if (pte_protnone(vmf->orig_pte) && vma_is_accessible(vmf->vma))
+	if (pte_protnone(vmf->orig_pte) && vma_is_accessible(vmf->vma)) {
+		mm_stats_set_flag(pftrace, MM_STATS_PF_NUMA);
 		return do_numa_page(vmf);
+	}
 
 	vmf->ptl = pte_lockptr(vmf->vma->vm_mm, vmf->pmd);
 	spin_lock(vmf->ptl);
@@ -4635,8 +4673,10 @@ static vm_fault_t handle_pte_fault(struct vm_fault *vmf)
 		goto unlock;
 	}
 	if (vmf->flags & FAULT_FLAG_WRITE) {
-		if (!pte_write(entry))
-			return do_wp_page(vmf);
+		if (!pte_write(entry)) {
+			mm_stats_set_flag(pftrace, MM_STATS_PF_WP);
+			return do_wp_page(vmf, pftrace);
+		}
 		entry = pte_mkdirty(entry);
 	}
 	entry = pte_mkyoung(entry);
@@ -4668,7 +4708,8 @@ unlock:
  * return value.  See filemap_fault() and __lock_page_or_retry().
  */
 static vm_fault_t __handle_mm_fault(struct vm_area_struct *vma,
-		unsigned long address, unsigned int flags)
+		unsigned long address, unsigned int flags,
+		struct mm_stats_pftrace *pftrace)
 {
 	struct vm_fault vmf = {
 		.vma = vma,
@@ -4682,6 +4723,9 @@ static vm_fault_t __handle_mm_fault(struct vm_area_struct *vma,
 	pgd_t *pgd;
 	p4d_t *p4d;
 	vm_fault_t ret;
+	struct mm_cost_delta mm_cost_delta;
+	struct mm_action mm_action;
+	bool should_do;
 
 	pgd = pgd_offset(mm, address);
 	p4d = p4d_alloc(mm, pgd, address);
@@ -4693,10 +4737,24 @@ static vm_fault_t __handle_mm_fault(struct vm_area_struct *vma,
 		return VM_FAULT_OOM;
 retry_pud:
 	if (pud_none(*vmf.pud) && __transparent_hugepage_enabled(vma)) {
-		ret = create_huge_pud(&vmf);
-		if (!(ret & VM_FAULT_FALLBACK))
-			return ret;
+		// (markm) No entry present.
+
+		// (markm) run the estimator to check if we should create a 1GB page.
+		mm_action.address = address;
+		mm_action.action = MM_ACTION_PROMOTE_HUGE;
+		mm_action.huge_page_order = HPAGE_PUD_SHIFT-PAGE_SHIFT;
+		mm_estimate_changes(&mm_action, &mm_cost_delta);
+		should_do = mm_decide(&mm_cost_delta);
+
+		if (should_do) {
+			ret = create_huge_pud(&vmf);
+			if (!(ret & VM_FAULT_FALLBACK)) {
+				mm_stats_set_flag(pftrace, MM_STATS_PF_VERY_HUGE_PAGE);
+				return ret;
+			}
+		}
 	} else {
+		// (markm) Entry is already present.
 		pud_t orig_pud = *vmf.pud;
 
 		barrier();
@@ -4706,8 +4764,11 @@ retry_pud:
 
 			if (dirty && !pud_write(orig_pud)) {
 				ret = wp_huge_pud(&vmf, orig_pud);
-				if (!(ret & VM_FAULT_FALLBACK))
+				if (!(ret & VM_FAULT_FALLBACK)) {
+					mm_stats_set_flag(pftrace, MM_STATS_PF_VERY_HUGE_PAGE);
+					mm_stats_set_flag(pftrace, MM_STATS_PF_WP);
 					return ret;
+				}
 			} else {
 				huge_pud_set_accessed(&vmf, orig_pud);
 				return 0;
@@ -4724,10 +4785,23 @@ retry_pud:
 		goto retry_pud;
 
 	if (pmd_none(*vmf.pmd) && __transparent_hugepage_enabled(vma)) {
-		ret = create_huge_pmd(&vmf);
-		if (!(ret & VM_FAULT_FALLBACK))
-			return ret;
+		// (markm) No entry present.
+
+		// (markm) run the estimator to check if we should create a 2MB page.
+		mm_action.address = address;
+		mm_action.action = MM_ACTION_PROMOTE_HUGE;
+		mm_action.huge_page_order = HPAGE_PMD_ORDER;
+		mm_estimate_changes(&mm_action, &mm_cost_delta);
+		should_do = mm_decide(&mm_cost_delta);
+
+		if (should_do) {
+			ret = create_huge_pmd(&vmf, pftrace, mm_cost_delta.extra);
+			if (!(ret & VM_FAULT_FALLBACK))
+				return ret;
+		}
 	} else {
+		// (markm) Entry is already present.
+
 		vmf.orig_pmd = *vmf.pmd;
 
 		barrier();
@@ -4739,11 +4813,16 @@ retry_pud:
 			return 0;
 		}
 		if (pmd_trans_huge(vmf.orig_pmd) || pmd_devmap(vmf.orig_pmd)) {
-			if (pmd_protnone(vmf.orig_pmd) && vma_is_accessible(vma))
+			if (pmd_protnone(vmf.orig_pmd) && vma_is_accessible(vma)) {
+				mm_stats_set_flag(pftrace, MM_STATS_PF_NUMA);
 				return do_huge_pmd_numa_page(&vmf);
+			}
 
+			// TODO(markm): wp_huge_pmd/pud are for huge COW
+			// faults. Should add mm-econ logic here too.
 			if (dirty && !pmd_write(vmf.orig_pmd)) {
-				ret = wp_huge_pmd(&vmf);
+				ret = wp_huge_pmd(&vmf, pftrace);
+				mm_stats_set_flag(pftrace, MM_STATS_PF_WP);
 				if (!(ret & VM_FAULT_FALLBACK))
 					return ret;
 			} else {
@@ -4753,7 +4832,7 @@ retry_pud:
 		}
 	}
 
-	return handle_pte_fault(&vmf);
+	return handle_pte_fault(&vmf, pftrace) | VM_FAULT_BASE_PAGE;
 }
 
 /**
@@ -4824,7 +4903,8 @@ static inline void mm_account_fault(struct pt_regs *regs,
  * return value.  See filemap_fault() and __lock_page_or_retry().
  */
 vm_fault_t handle_mm_fault(struct vm_area_struct *vma, unsigned long address,
-			   unsigned int flags, struct pt_regs *regs)
+			   unsigned int flags, struct pt_regs *regs,
+			   struct mm_stats_pftrace *pftrace)
 {
 	vm_fault_t ret;
 
@@ -4851,7 +4931,7 @@ vm_fault_t handle_mm_fault(struct vm_area_struct *vma, unsigned long address,
 	if (unlikely(is_vm_hugetlb_page(vma)))
 		ret = hugetlb_fault(vma->vm_mm, vma, address, flags);
 	else
-		ret = __handle_mm_fault(vma, address, flags);
+		ret = __handle_mm_fault(vma, address, flags, pftrace);
 
 	if (flags & FAULT_FLAG_USER) {
 		mem_cgroup_exit_user_fault();
@@ -5341,6 +5421,9 @@ static inline void process_huge_page(
 	int i, n, base, l;
 	unsigned long addr = addr_hint &
 		~(((unsigned long)pages_per_huge_page << PAGE_SHIFT) - 1);
+	
+	u64 start = rdtsc();
+	u64 start_single;
 
 	/* Process target subpage last to keep its cache lines hot */
 	might_sleep();
@@ -5352,7 +5435,11 @@ static inline void process_huge_page(
 		/* Process subpages at the end of huge page */
 		for (i = pages_per_huge_page - 1; i >= 2 * n; i--) {
 			cond_resched();
+			start_single = rdtsc();
 			process_subpage(addr + i * PAGE_SIZE, i, arg);
+			mm_stats_hist_measure(
+				&mm_process_huge_page_single_page_cycles,
+				rdtsc() - start_single);
 		}
 	} else {
 		/* If target subpage in second half of huge page */
@@ -5361,7 +5448,11 @@ static inline void process_huge_page(
 		/* Process subpages at the begin of huge page */
 		for (i = 0; i < base; i++) {
 			cond_resched();
+			start_single = rdtsc();
 			process_subpage(addr + i * PAGE_SIZE, i, arg);
+			mm_stats_hist_measure(
+				&mm_process_huge_page_single_page_cycles,
+				rdtsc() - start_single);
 		}
 	}
 	/*
@@ -5373,10 +5464,20 @@ static inline void process_huge_page(
 		int right_idx = base + 2 * l - 1 - i;
 
 		cond_resched();
+		start_single = rdtsc();
 		process_subpage(addr + left_idx * PAGE_SIZE, left_idx, arg);
+		mm_stats_hist_measure(
+			&mm_process_huge_page_single_page_cycles,
+			rdtsc() - start_single);
 		cond_resched();
+		start_single = rdtsc();
 		process_subpage(addr + right_idx * PAGE_SIZE, right_idx, arg);
+		mm_stats_hist_measure(
+			&mm_process_huge_page_single_page_cycles,
+			rdtsc() - start_single);
 	}
+
+	mm_stats_hist_measure(&mm_process_huge_page_cycles, rdtsc() - start);
 }
 
 static void clear_gigantic_page(struct page *page,
@@ -5398,6 +5499,8 @@ static void clear_subpage(unsigned long addr, int idx, void *arg)
 {
 	struct page *page = arg;
 
+	if (PageZeroed(page + idx)) return;
+
 	clear_user_highpage(page + idx, addr);
 }
 
@@ -5406,6 +5509,7 @@ void clear_huge_page(struct page *page,
 {
 	unsigned long addr = addr_hint &
 		~(((unsigned long)pages_per_huge_page << PAGE_SHIFT) - 1);
+	u64 start = rdtsc();
 
 	if (unlikely(pages_per_huge_page > MAX_ORDER_NR_PAGES)) {
 		clear_gigantic_page(page, addr, pages_per_huge_page);
@@ -5413,6 +5517,8 @@ void clear_huge_page(struct page *page,
 	}
 
 	process_huge_page(addr_hint, pages_per_huge_page, clear_subpage, page);
+
+	mm_stats_hist_measure(&mm_huge_page_fault_clear_cycles, rdtsc() - start);
 }
 
 static void copy_user_gigantic_page(struct page *dst, struct page *src,
@@ -5459,6 +5565,7 @@ void copy_user_huge_page(struct page *dst, struct page *src,
 		.src = src,
 		.vma = vma,
 	};
+	u64 start = rdtsc();
 
 	if (unlikely(pages_per_huge_page > MAX_ORDER_NR_PAGES)) {
 		copy_user_gigantic_page(dst, src, addr, vma,
@@ -5467,6 +5574,8 @@ void copy_user_huge_page(struct page *dst, struct page *src,
 	}
 
 	process_huge_page(addr_hint, pages_per_huge_page, copy_subpage, &arg);
+
+	mm_stats_hist_measure(&mm_huge_page_fault_cow_copy_huge_cycles, rdtsc() - start);
 }
 
 long copy_huge_page_from_user(struct page *dst_page,
