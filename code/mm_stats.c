@@ -7,6 +7,7 @@
 #include <linux/vmalloc.h>
 #include <linux/slab.h>
 #include <linux/fs.h>
+#include <linux/proc_fs.h>
 #include <linux/hashtable.h>
 #include <linux/cred.h>
 
@@ -70,7 +71,7 @@ static int hist_sprintf(struct file *file, char __user *ubuf,
         return len; \
     } \
     \
-    static struct file_operations name##_ops = \
+    static struct proc_ops name##_ops = \
     { \
         .write = name##_write_cb, \
         .read = name##_read_cb, \
@@ -91,7 +92,7 @@ static int hist_sprintf(struct file *file, char __user *ubuf,
         return hist_sprintf(file, ubuf, count, ppos, &name); \
     } \
     \
-    static struct file_operations name##_ops = \
+    static struct proc_ops name##_ops = \
     { \
         .read = name##_read_cb, \
     };
@@ -432,7 +433,7 @@ static ssize_t rejected_hash_read_cb(
     return len;
 }
 
-static struct file_operations rejected_hash_ops =
+static struct proc_ops rejected_hash_ops =
 {
     .read = rejected_hash_read_cb,
 };
