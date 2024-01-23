@@ -19,6 +19,9 @@
 #include <linux/uaccess.h>		/* faulthandler_disabled()	*/
 #include <linux/efi.h>			/* efi_crash_gracefully_on_page_fault()*/
 #include <linux/mm_types.h>
+#include <linux/mm_stats.h>
+#include <linux/huge_mm.h>
+#include <linux/mm_econ.h>
 
 #include <asm/cpufeature.h>		/* boot_cpu_has, ...		*/
 #include <asm/traps.h>			/* dotraplinkage, ...		*/
@@ -1217,15 +1220,18 @@ NOKPROBE_SYMBOL(do_kern_addr_fault);
  * architecture, special for WRUSS.
  */
 static inline
-void do_user_addr_fault(struct pt_regs *regs,
+bool do_user_addr_fault(struct pt_regs *regs,
 			unsigned long error_code,
-			unsigned long address)
+			unsigned long address,
+			struct mm_stats_pftrace *pftrace)
 {
 	struct vm_area_struct *vma;
 	struct task_struct *tsk;
 	struct mm_struct *mm;
 	vm_fault_t fault;
 	unsigned int flags = FAULT_FLAG_DEFAULT;
+	bool is_huge = false;
+	int ret;
 
 	tsk = current;
 	mm = tsk->mm;
@@ -1239,15 +1245,15 @@ void do_user_addr_fault(struct pt_regs *regs,
 		 * VMA or look for extable entries.
 		 */
 		if (is_errata93(regs, address))
-			return;
+			return false;
 
 		page_fault_oops(regs, error_code, address);
-		return;
+		return false;
 	}
 
 	/* kprobes don't want to hook the spurious faults: */
 	if (WARN_ON_ONCE(kprobe_page_fault(regs, X86_TRAP_PF)))
-		return;
+		return false;
 
 	/*
 	 * Reserved bits are never expected to be set on
@@ -1271,7 +1277,7 @@ void do_user_addr_fault(struct pt_regs *regs,
 		 * invalid pointer.  get_kernel_nofault() will not get here.
 		 */
 		page_fault_oops(regs, error_code, address);
-		return;
+		return false;
 	}
 
 	/*
@@ -1280,7 +1286,7 @@ void do_user_addr_fault(struct pt_regs *regs,
 	 */
 	if (unlikely(faulthandler_disabled() || !mm)) {
 		bad_area_nosemaphore(regs, error_code, address);
-		return;
+		return false;
 	}
 
 	/*
@@ -1302,8 +1308,11 @@ void do_user_addr_fault(struct pt_regs *regs,
 
 	if (error_code & X86_PF_WRITE)
 		flags |= FAULT_FLAG_WRITE;
-	if (error_code & X86_PF_INSTR)
+	if (error_code & X86_PF_INSTR) {
 		flags |= FAULT_FLAG_INSTRUCTION;
+		mm_stats_set_flag(pftrace, MM_STATS_PF_EXEC);
+	}
+
 
 #ifdef CONFIG_X86_64
 	/*
@@ -1319,7 +1328,7 @@ void do_user_addr_fault(struct pt_regs *regs,
 	 */
 	if (is_vsyscall_vaddr(address)) {
 		if (emulate_vsyscall(error_code, regs, address))
-			return;
+			return false;
 	}
 #endif
 
@@ -1342,7 +1351,7 @@ void do_user_addr_fault(struct pt_regs *regs,
 			 * which we do not expect faults.
 			 */
 			bad_area_nosemaphore(regs, error_code, address);
-			return;
+			return false;
 		}
 retry:
 		mmap_read_lock(mm);
@@ -1358,17 +1367,17 @@ retry:
 	vma = find_vma(mm, address);
 	if (unlikely(!vma)) {
 		bad_area(regs, error_code, address);
-		return;
+		return false;
 	}
 	if (likely(vma->vm_start <= address))
 		goto good_area;
 	if (unlikely(!(vma->vm_flags & VM_GROWSDOWN))) {
 		bad_area(regs, error_code, address);
-		return;
+		return false;
 	}
 	if (unlikely(expand_stack(vma, address))) {
 		bad_area(regs, error_code, address);
-		return;
+		return false;
 	}
 
 	/*
@@ -1378,7 +1387,7 @@ retry:
 good_area:
 	if (unlikely(access_error(error_code, vma))) {
 		bad_area_access_error(regs, error_code, address, vma);
-		return;
+		return false;
 	}
 
 	/*
@@ -1394,7 +1403,13 @@ good_area:
 	 * userland). The return to userland is identified whenever
 	 * FAULT_FLAG_USER|FAULT_FLAG_KILLABLE are both set in flags.
 	 */
-	fault = handle_mm_fault(vma, address, flags, regs);
+	fault = handle_mm_fault(vma, address, flags, regs, pftrace);
+
+	is_huge = !(fault & (VM_FAULT_OOM | VM_FAULT_BASE_PAGE));
+
+	if (is_huge) {
+		mm_register_promotion(address & HPAGE_PMD_MASK);
+	}
 
 	if (fault_signal_pending(fault, regs)) {
 		/*
@@ -1405,7 +1420,7 @@ good_area:
 			kernelmode_fixup_or_oops(regs, error_code, address,
 						 SIGBUS, BUS_ADRERR,
 						 ARCH_DEFAULT_PKEY);
-		return;
+		return is_huge;
 	}
 
 	/*
@@ -1420,13 +1435,20 @@ good_area:
 	}
 
 	mmap_read_unlock(mm);
-	if (likely(!(fault & VM_FAULT_ERROR)))
-		return;
+	if (likely(!(fault & VM_FAULT_ERROR))) {
+		if (!is_huge && huge_addr_enabled(vma, address)) {
+			ret = promote_to_huge(mm, vma, address & HPAGE_PMD_MASK, pftrace);
+			if (ret == SCAN_SUCCEED) {
+				mm_register_promotion(address & HPAGE_PMD_MASK);
+			}
+		}
+		return is_huge;
+	}
 
 	if (fatal_signal_pending(current) && !user_mode(regs)) {
 		kernelmode_fixup_or_oops(regs, error_code, address,
 					 0, 0, ARCH_DEFAULT_PKEY);
-		return;
+		return is_huge;
 	}
 
 	if (fault & VM_FAULT_OOM) {
@@ -1435,7 +1457,7 @@ good_area:
 			kernelmode_fixup_or_oops(regs, error_code, address,
 						 SIGSEGV, SEGV_MAPERR,
 						 ARCH_DEFAULT_PKEY);
-			return;
+			return is_huge;
 		}
 
 		/*
@@ -1453,6 +1475,8 @@ good_area:
 		else
 			BUG();
 	}
+
+	return is_huge;
 }
 NOKPROBE_SYMBOL(do_user_addr_fault);
 
