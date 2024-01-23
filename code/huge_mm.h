@@ -7,7 +7,14 @@
 
 #include <linux/fs.h> /* only for vma_is_dax() */
 
-vm_fault_t do_huge_pmd_anonymous_page(struct vm_fault *vmf);
+// This struct is defined in linux/mm_stats.h, but I don't want to include it
+// here because means any change to that header would require recompiling a
+// bunch of the kernel.
+struct mm_stats_pftrace;
+
+extern vm_fault_t do_huge_pmd_anonymous_page(struct vm_fault *vmf,
+					     struct mm_stats_pftrace *pftrace,
+					     bool require_prezeroed);
 int copy_huge_pmd(struct mm_struct *dst_mm, struct mm_struct *src_mm,
 		  pmd_t *dst_pmd, pmd_t *src_pmd, unsigned long addr,
 		  struct vm_area_struct *dst_vma, struct vm_area_struct *src_vma);
@@ -24,7 +31,7 @@ static inline void huge_pud_set_accessed(struct vm_fault *vmf, pud_t orig_pud)
 }
 #endif
 
-vm_fault_t do_huge_pmd_wp_page(struct vm_fault *vmf);
+vm_fault_t do_huge_pmd_wp_page(struct vm_fault *vmf, struct mm_stats_pftrace *pftrace);
 struct page *follow_trans_huge_pmd(struct vm_area_struct *vma,
 				   unsigned long addr, pmd_t *pmd,
 				   unsigned int flags);
@@ -114,6 +121,46 @@ extern struct kobj_attribute shmem_enabled_attr;
 #define HPAGE_PUD_MASK	(~(HPAGE_PUD_SIZE - 1))
 
 extern unsigned long transparent_hugepage_flags;
+extern pid_t huge_addr_pid;
+extern u64 huge_addr;
+#define MAX_HUGE_ADDR_COMM 48
+extern char huge_addr_comm[MAX_HUGE_ADDR_COMM];
+
+bool huge_addr_enabled(struct vm_area_struct *vma, unsigned long address);
+
+int promote_to_huge(struct mm_struct *mm,
+		struct vm_area_struct *vma,
+		unsigned long address,
+		struct mm_stats_pftrace *pftrace);
+
+enum scan_result {
+	SCAN_FAIL,
+	SCAN_SUCCEED,
+	SCAN_PMD_NULL,
+	SCAN_EXCEED_NONE_PTE,
+	SCAN_PTE_NON_PRESENT,
+	SCAN_PAGE_RO,
+	SCAN_LACK_REFERENCED_PAGE,
+	SCAN_PAGE_NULL,
+	SCAN_SCAN_ABORT,
+	SCAN_PAGE_COUNT,
+	SCAN_PAGE_LRU,
+	SCAN_PAGE_LOCK,
+	SCAN_PAGE_ANON,
+	SCAN_PAGE_COMPOUND,
+	SCAN_ANY_PROCESS,
+	SCAN_VMA_NULL,
+	SCAN_VMA_CHECK,
+	SCAN_ADDRESS_RANGE,
+	SCAN_SWAP_CACHE_PAGE,
+	SCAN_DEL_PAGE_LRU,
+	SCAN_ALLOC_HUGE_PAGE_FAIL,
+	SCAN_CGROUP_CHARGE_FAIL,
+	SCAN_EXCEED_SWAP_PTE,
+	SCAN_TRUNCATED,
+	SCAN_PAGE_HAS_PRIVATE,
+	SCAN_MM_ECON_CANCEL,
+};
 
 static inline bool transhuge_vma_suitable(struct vm_area_struct *vma,
 		unsigned long haddr)
@@ -144,8 +191,11 @@ static inline bool transhuge_vma_enabled(struct vm_area_struct *vma,
  * to be used on vmas which are known to support THP.
  * Use transparent_hugepage_active otherwise
  */
-static inline bool __transparent_hugepage_enabled(struct vm_area_struct *vma)
+static inline bool __transparent_hugepage_enabled(struct vm_area_struct *vma,  unsigned long address)
 {
+	// markm: if huge_addr is on, use a huge page no matter what...
+	if (huge_addr_enabled(vma, address))
+		return true;
 
 	/*
 	 * If the hardware/firmware marked hugepage support disabled.
@@ -172,7 +222,7 @@ static inline bool __transparent_hugepage_enabled(struct vm_area_struct *vma)
 	return false;
 }
 
-bool transparent_hugepage_active(struct vm_area_struct *vma);
+bool transparent_hugepage_active(struct vm_area_struct *vma, unsigned long address);
 
 #define transparent_hugepage_use_zero_page()				\
 	(transparent_hugepage_flags &					\
@@ -359,7 +409,7 @@ static inline bool __transparent_hugepage_enabled(struct vm_area_struct *vma)
 	return false;
 }
 
-static inline bool transparent_hugepage_active(struct vm_area_struct *vma)
+static inline bool transparent_hugepage_active(struct vm_area_struct *vma, unsigned long address)
 {
 	return false;
 }
