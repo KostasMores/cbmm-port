@@ -1573,7 +1573,7 @@ DEFINE_IDTENTRY_RAW_ERRORCODE(exc_page_fault)
 
 	irqentry_exit(regs, state);
 	pftrace.end_tsc = rdtsc();
-	
+	`
 	if (huge) {
 		mm_stats_set_flag(&pftrace, MM_STATS_PF_HUGE_PAGE);
         mm_stats_hist_measure(&mm_huge_page_fault_cycles,
