@@ -1493,20 +1493,21 @@ trace_page_fault_entries(struct pt_regs *regs, unsigned long error_code,
 		trace_page_fault_kernel(address, regs, error_code);
 }
 
-static __always_inline void
+static __always_inline bool
 handle_page_fault(struct pt_regs *regs, unsigned long error_code,
-			      unsigned long address)
+			      unsigned long address, struct mm_stats_pftrace *pftrace)
 {
 	trace_page_fault_entries(regs, error_code, address);
 
 	if (unlikely(kmmio_fault(regs, address)))
-		return;
+		return false;
 
 	/* Was the fault on kernel-controlled part of the address space? */
 	if (unlikely(fault_in_kernel_space(address))) {
 		do_kern_addr_fault(regs, error_code, address);
+		return false;
 	} else {
-		do_user_addr_fault(regs, error_code, address);
+		return do_user_addr_fault(regs, error_code, address, pftrace);
 		/*
 		 * User address page fault handling might have reenabled
 		 * interrupts. Fixing up all potential exit points of
@@ -1522,6 +1523,10 @@ DEFINE_IDTENTRY_RAW_ERRORCODE(exc_page_fault)
 {
 	unsigned long address = read_cr2();
 	irqentry_state_t state;
+
+	bool huge;
+	struct mm_stats_pftrace pftrace;
+	mm_stats_pftrace_init(&pftrace);
 
 	prefetchw(&current->mm->mmap_lock);
 
@@ -1559,11 +1564,24 @@ DEFINE_IDTENTRY_RAW_ERRORCODE(exc_page_fault)
 	 * code reenabled RCU to avoid subsequent wreckage which helps
 	 * debuggability.
 	 */
+	pftrace.start_tsc = rdtsc();
 	state = irqentry_enter(regs);
 
 	instrumentation_begin();
-	handle_page_fault(regs, error_code, address);
+	huge = handle_page_fault(regs, error_code, address);
 	instrumentation_end();
 
 	irqentry_exit(regs, state);
+	pftrace.end_tsc = rdtsc();
+	
+	if (huge) {
+		mm_stats_set_flag(&pftrace, MM_STATS_PF_HUGE_PAGE);
+        mm_stats_hist_measure(&mm_huge_page_fault_cycles,
+			pftrace.end_tsc - pftrace.start_tsc);
+    } else {
+        mm_stats_hist_measure(&mm_base_page_fault_cycles,
+			pftrace.end_tsc - pftrace.start_tsc);
+    }
+
+    mm_stats_pftrace_submit(&pftrace, regs);
 }
