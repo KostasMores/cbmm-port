@@ -175,4 +175,10 @@ static inline int hotplug_memory_notifier(notifier_fn_t fn, int pri)
  */
 extern struct mutex text_mutex;
 
+// markm: given a virtual address, find the mapping in the huge_addr_pid. Set
+// the pfn, page struct, and a flag accordingly. If error, *page == NULL, and
+// pfn and is_huge are garbage.
+void get_page_mapping(unsigned long address, unsigned long *pfn,
+		struct page **page, bool *is_huge);
+
 #endif /* _LINUX_MEMORY_H_ */
