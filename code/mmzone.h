@@ -99,10 +99,15 @@ struct free_area {
 	unsigned long		nr_free;
 };
 
+// markm: if `front`, then take from the front; otherwise, take from the tail.
 static inline struct page *get_page_from_free_area(struct free_area *area,
-					    int migratetype)
+					    int migratetype, bool front)
 {
-	return list_first_entry_or_null(&area->free_list[migratetype],
+	if (front)
+		return list_first_entry_or_null(&area->free_list[migratetype],
+					struct page, lru);
+	else
+		return list_last_entry_or_null(&area->free_list[migratetype],
 					struct page, lru);
 }
 
