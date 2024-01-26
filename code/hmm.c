@@ -25,6 +25,7 @@
 #include <linux/dma-mapping.h>
 #include <linux/mmu_notifier.h>
 #include <linux/memory_hotplug.h>
+#include <linux/mm_stats.h>
 
 #include "internal.h"
 
@@ -66,6 +67,8 @@ static int hmm_vma_fault(unsigned long addr, unsigned long end,
 	struct hmm_vma_walk *hmm_vma_walk = walk->private;
 	struct vm_area_struct *vma = walk->vma;
 	unsigned int fault_flags = FAULT_FLAG_REMOTE;
+	struct mm_stats_pftrace pftrace; // dummy, not used
+	mm_stats_pftrace_init(&pftrace);
 
 	WARN_ON_ONCE(!required_fault);
 	hmm_vma_walk->last = addr;
@@ -77,7 +80,7 @@ static int hmm_vma_fault(unsigned long addr, unsigned long end,
 	}
 
 	for (; addr < end; addr += PAGE_SIZE)
-		if (handle_mm_fault(vma, addr, fault_flags, NULL) &
+		if (handle_mm_fault(vma, addr, fault_flags, NULL, &pftrace) &
 		    VM_FAULT_ERROR)
 			return -EFAULT;
 	return -EBUSY;
