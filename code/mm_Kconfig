@@ -888,6 +888,8 @@ config ARCH_HAS_HUGEPD
 config MAPPING_DIRTY_HELPERS
         bool
 
+source "mm/asynczero/Kconfig"
+
 config KMAP_LOCAL
 	bool
 
