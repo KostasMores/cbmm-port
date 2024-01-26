@@ -65,6 +65,7 @@
 #include <linux/compat.h>
 #include <linux/io_uring.h>
 #include <linux/sysfs.h>
+#include <linux/mm_econ.h>
 
 #include <linux/uaccess.h>
 #include <asm/unistd.h>
@@ -808,6 +809,14 @@ void __noreturn do_exit(long code)
 
 	profile_task_exit(tsk);
 	kcov_task_exit(tsk);
+
+#ifdef CONFIG_MM_ECON
+	// Bijan: When a process exits, check if we should stop tracking it for
+	// the memory profile
+	// We only care if the main thread exits, so check against tsk->pid
+	// instead of tsk->tgid
+	mm_profile_check_exiting_proc(tsk->pid);
+#endif
 
 	ptrace_event(PTRACE_EVENT_EXIT, code);
 
