@@ -34,6 +34,9 @@
 #include <linux/oom.h>
 #include <linux/numa.h>
 #include <linux/page_owner.h>
+#include <linux/mm_stats.h>
+#include <linux/rbtree.h>
+#include <linux/mm_econ.h>
 
 #include <asm/tlb.h>
 #include <asm/pgalloc.h>
@@ -64,6 +67,240 @@ static atomic_t huge_zero_refcount;
 struct page *huge_zero_page __read_mostly;
 unsigned long huge_zero_pfn __read_mostly = ~0UL;
 
+struct huge_addr_range {
+	struct rb_node node;
+	u64 start;
+	u64 end;
+};
+
+void get_page_mapping(unsigned long address, unsigned long *pfn,
+		struct page **page, bool *is_huge)
+{
+	struct task_struct *task;
+	struct mm_struct *mm;
+	struct vm_area_struct *vma;
+	pgd_t *pgd;
+	p4d_t *p4d;
+	pud_t *pud;
+	pmd_t *pmd;
+	spinlock_t *ptl;
+	pte_t *ptep;
+
+	*pfn = 0;
+	*page = NULL;
+	*is_huge = false;
+
+	// Get the VMA. If the process or VMA no longer exist. Exit early.
+	if (huge_addr_pid == 0) {
+		pr_warn("dump_mapping: no pid specified\n");
+		return;
+	}
+
+	task = get_pid_task(find_get_pid(huge_addr_pid), PIDTYPE_PID);
+	if (!task) {
+		pr_warn("no such pid for dump_mapping\n");
+		return;
+	}
+
+	pr_warn("dump_mapping: using task pid %d, comm=%16s, mm=%p\n",
+			huge_addr_pid, task->comm, task->mm);
+	mm = task->mm;
+	down_read(&mm->mmap_lock);
+
+	vma = find_vma(mm, address);
+	if (!vma) {
+		pr_warn("Unable to find VMA...\n");
+		goto out;
+	}
+
+	// Walk the page table until we find the mapping or confirm there is
+	// none.
+	pgd = pgd_offset(mm, address);
+	if (pgd_none(*pgd) || unlikely(pgd_bad(*pgd))) {
+		pr_warn("Unable to get pgd (pgd->p4d->pud->pmd->pte->page).\n");
+		goto out;
+	}
+
+	p4d = p4d_offset(pgd, address);
+	if (p4d_none(*p4d) || unlikely(p4d_bad(*p4d))) {
+		pr_warn("Unable to get p4d (pgd->p4d->pud->pmd->pte->page).\n");
+		goto out;
+	}
+
+	pud = pud_offset(p4d, address);
+	if (pud_none(*pud) || unlikely(pud_bad(*pud))) {
+		pr_warn("Unable to get pud (pgd->p4d->pud->pmd->pte->page).\n");
+		goto out;
+	}
+
+	pmd = pmd_offset(pud, address);
+	if (pmd_none(*pmd)) {
+		pr_warn("Unable to get pmd (pgd->p4d->pud->pmd->pte->page): %lx.\n",
+				native_pmd_val(*pmd));
+		goto out;
+	}
+
+	ptl = pmd_trans_huge_lock(pmd, vma);
+	if (ptl) {
+		if (pmd_present(*pmd)) {
+			*page = follow_trans_huge_pmd(vma, address, pmd, 0);
+			if (IS_ERR_OR_NULL(page)) {
+				pr_warn("dump_mapping: unexpectedly unable to follow huge page\n");
+				*page = NULL;
+				spin_unlock(ptl);
+				goto out;
+			}
+			pr_warn("dump_mapping: found huge page\n");
+
+			*is_huge = true;
+			*pfn = page_to_pfn(*page);
+
+			spin_unlock(ptl);
+			goto out;
+		}
+		spin_unlock(ptl);
+	}
+
+	*page = NULL;
+
+	if (pmd_trans_unstable(pmd)) {
+		pr_warn("dump_mapping: Unstable THP pmd. Try again.\n");
+		goto out;
+	}
+
+	ptep = pte_offset_map(pmd, address);
+	if (!pte_present(*ptep)) {
+		pr_warn("Unable to get pte (pgd->p4d->pud->pmd->pte->page).\n");
+		goto out;
+	}
+
+	// It's a base page
+	*is_huge = false;
+	*pfn = pte_pfn(*ptep);
+	*page = pfn_to_page(*pfn);
+
+out:
+	up_read(&mm->mmap_lock);
+	put_task_struct(task);
+	return;
+}
+
+static void huge_addr_range_insert(struct rb_root *root, struct huge_addr_range *new_range)
+{
+	struct rb_node **link = &root->rb_node;
+	struct rb_node *parent = NULL;
+	struct huge_addr_range *range;
+	u64 start = new_range->start;
+
+	while (*link) {
+		parent = *link;
+		range = container_of(parent, struct huge_addr_range, node);
+
+		if (start < range->start)
+			link = &(*link)->rb_left;
+		else if (start > range->start)
+			link = &(*link)->rb_right;
+		else {
+			printk(KERN_WARNING "Cannot use the same start value in more than one range!\n");
+			return;
+		}
+	}
+
+	rb_link_node(&new_range->node, parent, link);
+	rb_insert_color(&new_range->node, root);
+}
+
+static bool huge_addr_in_range(struct rb_root *root, u64 addr)
+{
+	struct rb_node *node = root->rb_node;
+	struct huge_addr_range *range;
+
+	while (node) {
+		range = container_of(node, struct huge_addr_range, node);
+
+		if (addr < range->start)
+			node = node->rb_left;
+		else if (addr >= range->start && addr < range->end)
+			return true;
+		else
+			node = node->rb_right;
+	}
+
+	return false;
+}
+
+static void huge_addr_free_tree(struct rb_root *root)
+{
+	struct huge_addr_range *range;
+	struct rb_node *node;
+
+	while ((node = rb_first(root))) {
+		range = container_of(node, struct huge_addr_range, node);
+		rb_erase(node, root);
+		kfree(range);
+	}
+}
+
+// Is huge_addr enabled for the huge page containing `address`?
+bool huge_addr_enabled(struct vm_area_struct *vma, unsigned long address)
+{
+	pid_t vma_owner_pid;
+	unsigned long fault_address_aligned = address & PMD_PAGE_MASK;
+
+	if (huge_addr_pid == 0 || (huge_addr == 0 && huge_addr_mode != 3)) {
+		return false;
+	}
+
+	// Check the PID of the faulting process...
+	rcu_read_lock();
+	vma_owner_pid = vma->vm_mm->owner->pid;
+	rcu_read_unlock();
+
+	if (vma_owner_pid != huge_addr_pid) {
+		return false;
+	}
+
+	// Check if the fault address's vma is large enough for a huge page.
+	if (vma->vm_start > fault_address_aligned ||
+	    vma->vm_end <= (fault_address_aligned + HPAGE_PMD_SIZE))
+	{
+		return false;
+	}
+
+	// Check if the fault address is within the huge region...
+	switch (huge_addr_mode) {
+		case 0:
+			if (huge_addr == fault_address_aligned) {
+				return true;
+			}
+			break;
+
+		case 1: // huge addr is highest, so true if lower
+			if (address < huge_addr) {
+				return true;
+			}
+			break;
+
+		case 2:
+			if (address >= huge_addr) {
+				return true;
+			}
+			break;
+
+		case 3:
+			if (huge_addr_in_range(&huge_addr_range_tree, address)) {
+				return true;
+			}
+			break;
+
+		default:
+			BUG();
+	}
+
+	// Any other case.
+	return false;
+}
+
 static inline bool file_thp_enabled(struct vm_area_struct *vma)
 {
 	return transhuge_vma_enabled(vma, vma->vm_flags) && vma->vm_file &&
@@ -71,7 +308,7 @@ static inline bool file_thp_enabled(struct vm_area_struct *vma)
 	       (vma->vm_flags & VM_EXEC);
 }
 
-bool transparent_hugepage_active(struct vm_area_struct *vma)
+bool transparent_hugepage_active(struct vm_area_struct *vma, unsigned long address)
 {
 	/* The addr is used to check if the vma size fits */
 	unsigned long addr = (vma->vm_end & HPAGE_PMD_MASK) - HPAGE_PMD_SIZE;
@@ -79,7 +316,7 @@ bool transparent_hugepage_active(struct vm_area_struct *vma)
 	if (!transhuge_vma_suitable(vma, addr))
 		return false;
 	if (vma_is_anonymous(vma))
-		return __transparent_hugepage_enabled(vma);
+		return __transparent_hugepage_enabled(vma, address);
 	if (vma_is_shmem(vma))
 		return shmem_huge_enabled(vma);
 	if (IS_ENABLED(CONFIG_READ_ONLY_THP_FOR_FS))
@@ -307,6 +544,228 @@ static ssize_t defrag_store(struct kobject *kobj,
 static struct kobj_attribute defrag_attr =
 	__ATTR(defrag, 0644, defrag_show, defrag_store);
 
+static ssize_t huge_addr_pid_show(struct kobject *kobj,
+			   struct kobj_attribute *attr, char *buf)
+{
+	return sprintf(buf, "%d\n", huge_addr_pid);
+}
+
+static ssize_t huge_addr_pid_store(struct kobject *kobj,
+			       struct kobj_attribute *attr,
+			       const char *buf, size_t count)
+{
+	pid_t pid;
+	int ret;
+
+	ret = kstrtoint(buf, 0, &pid);
+
+	if (ret != 0) {
+		huge_addr_pid = 0;
+		return ret;
+	}
+	// Check that this is an existing process.
+	else if (find_vpid(pid) != NULL) {
+		huge_addr_pid = pid;
+		return count;
+	}
+	// Not a valid PID.
+	else {
+		huge_addr_pid = 0;
+		return -EINVAL;
+	}
+}
+
+static struct kobj_attribute huge_addr_pid_attr =
+	__ATTR(huge_addr_pid, 0644, huge_addr_pid_show, huge_addr_pid_store);
+
+static ssize_t huge_addr_comm_show(struct kobject *kobj,
+			   struct kobj_attribute *attr, char *buf)
+{
+	return sprintf(buf, "%s\n", huge_addr_comm);
+}
+
+static ssize_t huge_addr_comm_store(struct kobject *kobj,
+			       struct kobj_attribute *attr,
+			       const char *buf, size_t count)
+{
+	huge_addr_comm[MAX_HUGE_ADDR_COMM - 1] = 0;
+	strncpy(huge_addr_comm, buf, MAX_HUGE_ADDR_COMM-1);
+
+	return count;
+}
+static struct kobj_attribute huge_addr_comm_attr =
+	__ATTR(huge_addr_comm, 0644, huge_addr_comm_show, huge_addr_comm_store);
+
+static ssize_t huge_addr_mode_show(struct kobject *kobj,
+			   struct kobj_attribute *attr, char *buf)
+{
+	return sprintf(buf, "%d\n", huge_addr_mode);
+}
+
+static ssize_t huge_addr_mode_store(struct kobject *kobj,
+			       struct kobj_attribute *attr,
+			       const char *buf, size_t count)
+{
+	int mode;
+	int ret;
+
+	ret = kstrtoint(buf, 0, &mode);
+
+	if (ret != 0) {
+		huge_addr_mode = 0;
+		return ret;
+	}
+	else if (mode >= 0 && mode <= 3) {
+		huge_addr_mode = mode;
+		return count;
+	}
+	else {
+		huge_addr_mode = 0;
+		return -EINVAL;
+	}
+}
+static struct kobj_attribute huge_addr_mode_attr =
+	__ATTR(huge_addr_mode, 0644, huge_addr_mode_show, huge_addr_mode_store);
+
+static ssize_t huge_addr_show(struct kobject *kobj,
+			   struct kobj_attribute *attr, char *buf)
+{
+	if (huge_addr_mode == 3) {
+		int write_cnt = 0;
+		struct huge_addr_range *range;
+		struct rb_node *node = rb_first(&huge_addr_range_tree);
+
+		while (node) {
+			range = container_of(node, struct huge_addr_range, node);
+
+			write_cnt += sprintf(&buf[write_cnt], "0x%llx 0x%llx;",
+				range->start, range->end);
+
+			node = rb_next(node);
+		}
+		//Replace the last ';' with a newline
+		buf[write_cnt - 1] = '\n';
+
+		return write_cnt;
+	} else {
+		return sprintf(buf, "0x%llx\n", huge_addr);
+	}
+}
+
+static void try_huge_addr_promote(pid_t pid, u64 addr)
+{
+	struct mm_struct *mm;
+	struct vm_area_struct *vma;
+	struct task_struct *target_task = get_pid_task(find_get_pid(pid), PIDTYPE_PID);
+	struct mm_stats_pftrace pftrace; // dummy, not used
+	mm_stats_pftrace_init(&pftrace);
+
+	if (!target_task) {
+		pr_info("no such pid for promotion");
+		return;
+	}
+
+	mm = target_task->mm;
+	vma = find_vma(mm, addr);
+
+	promote_to_huge(mm, vma, addr, &pftrace);
+
+	put_task_struct(target_task);
+}
+
+static ssize_t huge_addr_store(struct kobject *kobj,
+			       struct kobj_attribute *attr,
+			       const char *buf, size_t count)
+{
+	u64 addr;
+	int ret;
+
+	if (huge_addr_mode == 3) {
+		char *tok = (char *)buf;
+		struct rb_root new_tree = RB_ROOT;
+		struct huge_addr_range *range = NULL;
+		ssize_t error;
+
+		// Try to read in all of the ranges
+		while (tok) {
+			char *addr_buf;
+
+			range = kmalloc(sizeof(struct huge_addr_range), GFP_KERNEL);
+			if (!range) {
+				error = -ENOMEM;
+				goto err;
+			}
+
+			// Get the beginning of the range
+			addr_buf = strsep(&tok, " ");
+			if (!addr_buf) {
+				error = -EINVAL;
+				goto err;
+			}
+
+			ret = kstrtoull(addr_buf, 0, &addr);
+			if (ret != 0) {
+				error = -EINVAL;
+				goto err;
+			}
+
+			range->start = addr;
+
+			// Get the end of the range
+			addr_buf = strsep(&tok, ";");
+			if (!addr_buf) {
+				error = -EINVAL;
+				goto err;
+			}
+
+			ret = kstrtoull(addr_buf, 0, &addr);
+			if (ret != 0) {
+				error = -EINVAL;
+				goto err;
+			}
+
+			range->end = addr;
+
+			huge_addr_range_insert(&new_tree, range);
+		}
+
+		//Free the old tree if it exists
+		huge_addr_free_tree(&huge_addr_range_tree);
+		//Set the new tree
+		huge_addr_range_tree = new_tree;
+
+		return count;
+
+err:
+		if (range)
+			kfree(range);
+		huge_addr_free_tree(&new_tree);
+		return error;
+	} else {
+		ret = kstrtoull(buf, 0, &addr);
+
+		if (ret != 0) {
+			huge_addr = 0;
+			return ret;
+		} else if ((addr & PMD_PAGE_MASK) == addr) {
+			huge_addr = addr;
+
+			// If the pid is set, the we should check if the page is
+			// already mapped. If so, then we should promote it.
+			if (huge_addr_pid != 0) {
+				try_huge_addr_promote(huge_addr_pid, huge_addr);
+			}
+
+			return count;
+		} else {
+			huge_addr = 0;
+			return -EINVAL;
+		}
+	}
+}
+static struct kobj_attribute huge_addr_attr =
+	__ATTR(huge_addr, 0644, huge_addr_show, huge_addr_store);
+
 static ssize_t use_zero_page_show(struct kobject *kobj,
 				  struct kobj_attribute *attr, char *buf)
 {
@@ -338,6 +797,10 @@ static struct attribute *hugepage_attr[] = {
 #ifdef CONFIG_SHMEM
 	&shmem_enabled_attr.attr,
 #endif
+	&huge_addr_attr.attr,
+	&huge_addr_pid_attr.attr,
+	&huge_addr_comm_attr.attr,
+	&huge_addr_mode_attr.attr,
 	NULL,
 };
 
@@ -593,8 +1056,12 @@ out:
 }
 EXPORT_SYMBOL_GPL(thp_get_unmapped_area);
 
+// markm: defined in page_alloc.c... but I don't want to touch one of the big
+// header files and have to recompile everything...
+inline void lfpa_update(u64);
+
 static vm_fault_t __do_huge_pmd_anonymous_page(struct vm_fault *vmf,
-			struct page *page, gfp_t gfp)
+			struct page *page, gfp_t gfp, struct mm_stats_pftrace *pftrace)
 {
 	struct vm_area_struct *vma = vmf->vma;
 	pgtable_t pgtable;
@@ -617,7 +1084,13 @@ static vm_fault_t __do_huge_pmd_anonymous_page(struct vm_fault *vmf,
 		goto release;
 	}
 
-	clear_huge_page(page, vmf->address, HPAGE_PMD_NR);
+	pftrace->prep_start_tsc = rdtsc();
+	lfpa_update(rdtsc());
+	if(PageZeroed(page))
+		mm_stats_set_flag(pftrace, MM_STATS_PF_ALLOC_PREZEROED);
+	else
+		clear_huge_page(page, vmf->address, HPAGE_PMD_NR);
+	pftrace->prep_end_tsc = rdtsc();
 	/*
 	 * The memory barrier inside __SetPageUptodate makes sure that
 	 * clear_huge_page writes become visible before the set_pmd_at()
@@ -679,9 +1152,30 @@ release:
  *	    available
  * never: never stall for any thp allocation
  */
-gfp_t vma_thp_gfp_mask(struct vm_area_struct *vma)
+gfp_t vma_thp_gfp_mask(struct vm_area_struct *vma, unsigned long haddr)
 {
 	const bool vma_madvised = vma && (vma->vm_flags & VM_HUGEPAGE);
+
+	if (mm_econ_is_on()) {
+		struct mm_cost_delta mm_cost_delta;
+		struct mm_action mm_action;
+		bool should_do;
+
+		mm_action.address = haddr;
+		mm_action.action = MM_ACTION_ALLOC_RECLAIM;
+		mm_action.huge_page_order = HPAGE_PUD_SHIFT-PAGE_SHIFT;
+		mm_estimate_changes(&mm_action, &mm_cost_delta);
+		should_do = mm_decide(&mm_cost_delta);
+
+		// TODO: Also eval if __GFP_KSWAPD_RECLAIM is worth it...
+		// perhaps if value of THP is high but cost of direct reclaim
+		// is too high.
+		if (should_do) {
+			return GFP_TRANSHUGE_LIGHT | __GFP_DIRECT_RECLAIM;
+		} else {
+			return GFP_TRANSHUGE_LIGHT;
+		}
+	}
 
 	/* Always do synchronous compaction */
 	if (test_bit(TRANSPARENT_HUGEPAGE_DEFRAG_DIRECT_FLAG, &transparent_hugepage_flags))
@@ -721,12 +1215,16 @@ static void set_huge_zero_page(pgtable_t pgtable, struct mm_struct *mm,
 	mm_inc_nr_ptes(mm);
 }
 
-vm_fault_t do_huge_pmd_anonymous_page(struct vm_fault *vmf)
+vm_fault_t do_huge_pmd_anonymous_page(struct vm_fault *vmf,
+					  struct mm_stats_pftrace *pftrace,
+					  bool require_prezeroed)
 {
 	struct vm_area_struct *vma = vmf->vma;
 	gfp_t gfp;
 	struct page *page;
 	unsigned long haddr = vmf->address & HPAGE_PMD_MASK;
+	vm_fault_t ret;
+	u64 start = rdtsc();
 
 	if (!transhuge_vma_suitable(vma, haddr))
 		return VM_FAULT_FALLBACK;
@@ -739,7 +1237,6 @@ vm_fault_t do_huge_pmd_anonymous_page(struct vm_fault *vmf)
 			transparent_hugepage_use_zero_page()) {
 		pgtable_t pgtable;
 		struct page *zero_page;
-		vm_fault_t ret;
 		pgtable = pte_alloc_one(vma->vm_mm);
 		if (unlikely(!pgtable))
 			return VM_FAULT_OOM;
@@ -766,6 +1263,11 @@ vm_fault_t do_huge_pmd_anonymous_page(struct vm_fault *vmf)
 						   haddr, vmf->pmd, zero_page);
 				update_mmu_cache_pmd(vma, vmf->address, vmf->pmd);
 				spin_unlock(vmf->ptl);
+				// Here is the equivalent part of set being true.
+				mm_stats_set_flag(pftrace, MM_STATS_PF_ZERO);
+				mm_stats_hist_measure(
+					&mm_huge_page_fault_zero_page_cycles,
+					rdtsc() - start);
 			}
 		} else {
 			spin_unlock(vmf->ptl);
@@ -773,14 +1275,43 @@ vm_fault_t do_huge_pmd_anonymous_page(struct vm_fault *vmf)
 		}
 		return ret;
 	}
-	gfp = vma_thp_gfp_mask(vma);
+	pftrace->alloc_start_tsc = rdtsc();
+	gfp = vma_thp_gfp_mask(vma, haddr);
 	page = alloc_hugepage_vma(gfp, vma, haddr, HPAGE_PMD_ORDER);
+	pftrace->alloc_end_tsc = rdtsc();
+	mm_stats_check_alloc_fallback(pftrace);
+	mm_stats_check_alloc_zeroing(pftrace);
 	if (unlikely(!page)) {
+		mm_stats_set_flag(pftrace, MM_STATS_PF_HUGE_ALLOC_FAILED);
+		count_vm_event(THP_FAULT_FALLBACK);
+		return VM_FAULT_FALLBACK;
+	} else if (mm_econ_is_on() && require_prezeroed && !PageZeroed(page)) {
+		// HACK (markm): If the estimator assumed that a prezeroed page
+		// would be availabe, make sure that we don't use an unzeroed
+		// page. The correct way to do this would be to fix the way we
+		// estimate if a prezeroed page is available or to fix the page
+		// allocator to be more predictable. However, after some time
+		// trying, the existing allocator is a bit convoluted and we
+		// have a deadline, so....
+
+		if (mm_econ_debugging_mode == 3) {
+			pr_warn("estimator: conflict page %p", page);
+		}
+
+		// Free the page to avoid a leak.
+		__free_pages(page, HPAGE_PMD_ORDER);
+
+		// Act like a failure.
+		mm_stats_set_flag(pftrace, MM_STATS_PF_HUGE_ALLOC_FAILED);
 		count_vm_event(THP_FAULT_FALLBACK);
 		return VM_FAULT_FALLBACK;
 	}
 	prep_transhuge_page(page);
-	return __do_huge_pmd_anonymous_page(vmf, page, gfp);
+	ret = __do_huge_pmd_anonymous_page(vmf, page, gfp, pftrace);
+
+	mm_stats_hist_measure(&mm_huge_page_fault_create_new_cycles, rdtsc() - start);
+
+	return ret;
 }
 
 static void insert_pfn_pmd(struct vm_area_struct *vma, unsigned long addr,
@@ -1280,7 +1811,7 @@ unlock:
 	spin_unlock(vmf->ptl);
 }
 
-vm_fault_t do_huge_pmd_wp_page(struct vm_fault *vmf)
+vm_fault_t do_huge_pmd_wp_page(struct vm_fault *vmf, struct mm_stats_pftrace *pftrace)
 {
 	struct vm_area_struct *vma = vmf->vma;
 	struct page *page;
