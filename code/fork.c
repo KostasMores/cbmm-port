@@ -97,6 +97,7 @@
 #include <linux/scs.h>
 #include <linux/io_uring.h>
 #include <linux/bpf.h>
+#include <linux/mm_econ.h>
 
 #include <asm/pgalloc.h>
 #include <linux/uaccess.h>
@@ -2625,6 +2626,9 @@ pid_t kernel_clone(struct kernel_clone_args *args)
 		get_task_struct(p);
 	}
 
+	/* Copy the mm_econ profile if applicable */
+	mm_copy_profile(current->tgid, p->tgid);
+	
 	wake_up_new_task(p);
 
 	/* forking complete and child started to run, tell ptracer */
