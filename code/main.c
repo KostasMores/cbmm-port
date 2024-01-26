@@ -101,6 +101,7 @@
 #include <linux/stackdepot.h>
 #include <linux/randomize_kstack.h>
 #include <net/net_namespace.h>
+#include <linux/mm_stats.h>
 
 #include <asm/io.h>
 #include <asm/setup.h>
@@ -1596,6 +1597,8 @@ static noinline void __init kernel_init_freeable(void)
 	workqueue_init();
 
 	init_mm_internals();
+
+	mm_stats_init();
 
 	rcu_init_tasks_generic();
 	do_pre_smp_initcalls();
