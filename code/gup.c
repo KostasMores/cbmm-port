@@ -951,6 +951,8 @@ static int faultin_page(struct vm_area_struct *vma,
 {
 	unsigned int fault_flags = 0;
 	vm_fault_t ret;
+	struct mm_stats_pftrace pftrace; // dummy, not used
+	mm_stats_pftrace_init(&pftrace);
 
 	/* mlock all present pages, but do not fault in new pages */
 	if ((*flags & (FOLL_POPULATE | FOLL_MLOCK)) == FOLL_MLOCK)
@@ -973,7 +975,7 @@ static int faultin_page(struct vm_area_struct *vma,
 		fault_flags |= FAULT_FLAG_TRIED;
 	}
 
-	ret = handle_mm_fault(vma, address, fault_flags, NULL);
+	ret = handle_mm_fault(vma, address, fault_flags, NULL, &pftrace);
 	if (ret & VM_FAULT_ERROR) {
 		int err = vm_fault_to_errno(ret, *flags);
 
@@ -1301,6 +1303,8 @@ int fixup_user_fault(struct mm_struct *mm,
 {
 	struct vm_area_struct *vma;
 	vm_fault_t ret;
+	struct mm_stats_pftrace pftrace; // dummy, not used
+	mm_stats_pftrace_init(&pftrace);
 
 	address = untagged_addr(address);
 
@@ -1319,7 +1323,7 @@ retry:
 	    fatal_signal_pending(current))
 		return -EINTR;
 
-	ret = handle_mm_fault(vma, address, fault_flags, NULL);
+	ret = handle_mm_fault(vma, address, fault_flags, NULL, &pftrace);
 	if (ret & VM_FAULT_ERROR) {
 		int err = vm_fault_to_errno(ret, 0);
 
