@@ -30,6 +30,28 @@ static __meminit int shuffle_store(const char *val,
 }
 module_param_call(shuffle, shuffle_store, shuffle_show, &shuffle_param, 0400);
 
+int page_alloc_shuffle_order = DEFAULT_SHUFFLE_ORDER;
+module_param(page_alloc_shuffle_order, int, 0644);
+
+static bool shuffle_trigger;
+static int shuffle_trigger_store(const char *val,
+		const struct kernel_param *kp)
+{
+	int nid;
+
+	static_branch_enable(&page_alloc_shuffle_key);
+
+	pr_warn("page_alloc: shuffling free list order=%d\n", page_alloc_shuffle_order);
+
+	for_each_node_state(nid, N_MEMORY) {
+		shuffle_free_memory(NODE_DATA(nid));
+		pr_warn("page_alloc: shuffled nid=%d.\n", nid);
+	}
+
+	return 0;
+}
+module_param_call(shuffle_trigger, shuffle_trigger_store, shuffle_show, &shuffle_trigger, 0200);
+
 /*
  * For two pages to be swapped in the shuffle, they must be free (on a
  * 'free_area' lru), have the same order, and have the same migratetype.
@@ -83,7 +105,7 @@ void __meminit __shuffle_zone(struct zone *z)
 	unsigned long i, flags;
 	unsigned long start_pfn = z->zone_start_pfn;
 	unsigned long end_pfn = zone_end_pfn(z);
-	const int order = SHUFFLE_ORDER;
+	const int order = page_alloc_shuffle_order;
 	const int order_pages = 1 << order;
 
 	spin_lock_irqsave(&z->lock, flags);
@@ -151,7 +173,7 @@ void __meminit __shuffle_zone(struct zone *z)
  * __shuffle_free_memory - reduce the predictability of the page allocator
  * @pgdat: node page data
  */
-void __meminit __shuffle_free_memory(pg_data_t *pgdat)
+void __shuffle_free_memory(pg_data_t *pgdat)
 {
 	struct zone *z;
 
