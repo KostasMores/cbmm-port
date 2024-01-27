@@ -375,6 +375,25 @@ unsigned long randomize_page(unsigned long start, unsigned long range)
 	return start + (get_random_long() % range << PAGE_SHIFT);
 }
 
+unsigned long
+randomize_huge_page(unsigned long start, unsigned long range)
+{
+	if (!IS_ALIGNED(start, HPAGE_SIZE)) {
+		range -= ALIGN(start, HPAGE_SIZE) - start;
+		start = ALIGN(start, HPAGE_SIZE);
+	}
+
+	if (start > ULONG_MAX - range)
+		range = ULONG_MAX - start;
+
+	range >> HPAGE_SHIFT;
+
+	if (range == 0)
+		return start;
+
+	return start + (get_random_long() % range << HPAGE_SHIFT);
+}
+
 #ifdef CONFIG_ARCH_WANT_DEFAULT_TOPDOWN_MMAP_LAYOUT
 unsigned long arch_randomize_brk(struct mm_struct *mm)
 {
