@@ -38,6 +38,7 @@
 #include <linux/freezer.h>
 #include <linux/oom.h>
 #include <linux/numa.h>
+#include <linux/mm_stats.h>
 
 #include <asm/tlbflush.h>
 #include "internal.h"
@@ -469,6 +470,8 @@ static int break_ksm(struct vm_area_struct *vma, unsigned long addr)
 {
 	struct page *page;
 	vm_fault_t ret = 0;
+	struct mm_stats_pftrace pftrace; // dummy, not used
+	mm_stats_pftrace_init(&pftrace);
 
 	do {
 		cond_resched();
@@ -479,7 +482,7 @@ static int break_ksm(struct vm_area_struct *vma, unsigned long addr)
 		if (PageKsm(page))
 			ret = handle_mm_fault(vma, addr,
 					      FAULT_FLAG_WRITE | FAULT_FLAG_REMOTE,
-					      NULL);
+					      NULL, &pftrace);
 		else
 			ret = VM_FAULT_WRITE;
 		put_page(page);
