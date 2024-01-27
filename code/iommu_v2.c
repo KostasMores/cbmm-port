@@ -17,6 +17,7 @@
 #include <linux/wait.h>
 #include <linux/pci.h>
 #include <linux/gfp.h>
+#include <linux/mm_stats.h>
 
 #include "amd_iommu.h"
 
@@ -476,6 +477,8 @@ static void do_fault(struct work_struct *work)
 	unsigned int flags = 0;
 	struct mm_struct *mm;
 	u64 address;
+	struct mm_stats_pftrace pftrace; // dummy, not used
+	memset(&pftrace, 0, sizeof(pftrace));
 
 	mm = fault->state->mm;
 	address = fault->address;
@@ -496,7 +499,7 @@ static void do_fault(struct work_struct *work)
 	if (access_error(vma, fault))
 		goto out;
 
-	ret = handle_mm_fault(vma, address, flags, NULL);
+	ret = handle_mm_fault(vma, address, flags, NULL, &pftrace);
 out:
 	mmap_read_unlock(mm);
 
