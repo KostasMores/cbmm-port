@@ -98,6 +98,7 @@
 #include <linux/resctrl.h>
 #include <linux/cn_proc.h>
 #include <trace/events/oom.h>
+#include <linux/mm_econ.h>
 #include "internal.h"
 #include "fd.h"
 
@@ -150,6 +151,12 @@ struct pid_entry {
 	NOD(NAME, (S_IFREG|(MODE)),			\
 		NULL, &proc_pid_attr_operations,	\
 		{ .lsm = LSM })
+
+// This is a hack to get get_proc_taskin mm/estimator.c
+inline struct task_struct *extern_get_proc_task(const struct inode *inode)
+{
+    return get_proc_task(inode);
+}
 
 /*
  * Count the number of hardlinks for the pid_entry table, excluding the .
@@ -3312,6 +3319,10 @@ static const struct pid_entry tgid_base_stuff[] = {
 #ifdef CONFIG_SECCOMP_CACHE_DEBUG
 	ONE("seccomp_cache", S_IRUSR, proc_pid_seccomp_cache),
 #endif
+#ifdef CONFIG_MM_ECON
+    REG("mmap_filters", S_IRUGO|S_IWUSR, proc_mmap_filters_operations),
+    REG("mem_ranges", S_IRUGO, proc_mem_ranges_operations),
+#endif
 };
 
 static int proc_tgid_base_readdir(struct file *file, struct dir_context *ctx)
@@ -3646,6 +3657,10 @@ static const struct pid_entry tid_base_stuff[] = {
 #endif
 #ifdef CONFIG_SECCOMP_CACHE_DEBUG
 	ONE("seccomp_cache", S_IRUSR, proc_pid_seccomp_cache),
+#endif
+#ifdef CONFIG_MM_ECON
+    REG("mmap_filters", S_IRUGO|S_IWUSR, proc_mmap_filters_operations),
+    REG("mem_ranges", S_IRUGO, proc_mem_ranges_operations),
 #endif
 };
 
