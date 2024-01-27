@@ -18,40 +18,13 @@
 #include <linux/page_idle.h>
 #include <linux/swapops.h>
 #include <linux/shmem_fs.h>
+#include <linux/mm_econ.h>
+#include <linux/mm_stats.h>
+#include <linux/huge_mm.h>
 
 #include <asm/tlb.h>
 #include <asm/pgalloc.h>
 #include "internal.h"
-
-enum scan_result {
-	SCAN_FAIL,
-	SCAN_SUCCEED,
-	SCAN_PMD_NULL,
-	SCAN_EXCEED_NONE_PTE,
-	SCAN_EXCEED_SWAP_PTE,
-	SCAN_EXCEED_SHARED_PTE,
-	SCAN_PTE_NON_PRESENT,
-	SCAN_PTE_UFFD_WP,
-	SCAN_PAGE_RO,
-	SCAN_LACK_REFERENCED_PAGE,
-	SCAN_PAGE_NULL,
-	SCAN_SCAN_ABORT,
-	SCAN_PAGE_COUNT,
-	SCAN_PAGE_LRU,
-	SCAN_PAGE_LOCK,
-	SCAN_PAGE_ANON,
-	SCAN_PAGE_COMPOUND,
-	SCAN_ANY_PROCESS,
-	SCAN_VMA_NULL,
-	SCAN_VMA_CHECK,
-	SCAN_ADDRESS_RANGE,
-	SCAN_SWAP_CACHE_PAGE,
-	SCAN_DEL_PAGE_LRU,
-	SCAN_ALLOC_HUGE_PAGE_FAIL,
-	SCAN_CGROUP_CHARGE_FAIL,
-	SCAN_TRUNCATED,
-	SCAN_PAGE_HAS_PRIVATE,
-};
 
 #define CREATE_TRACE_POINTS
 #include <trace/events/huge_memory.h>
@@ -744,8 +717,10 @@ static void __collapse_huge_page_copy(pte_t *pte, struct page *page,
 				      struct vm_area_struct *vma,
 				      unsigned long address,
 				      spinlock_t *ptl,
-				      struct list_head *compound_pagelist)
+				      struct list_head *compound_pagelist,
+					  struct mm_stats_pftrace *pftrace)
 {
+	u64 start = rdtsc();
 	struct page *src_page, *tmp;
 	pte_t *_pte;
 	for (_pte = pte; _pte < pte + HPAGE_PMD_NR;
@@ -753,6 +728,7 @@ static void __collapse_huge_page_copy(pte_t *pte, struct page *page,
 		pte_t pteval = *_pte;
 
 		if (pte_none(pteval) || is_zero_pfn(pte_pfn(pteval))) {
+			mm_stats_set_flag(pftrace, MM_STATS_PF_CLEARED_MEM);
 			clear_user_highpage(page, address);
 			add_mm_counter(vma->vm_mm, MM_ANONPAGES, 1);
 			if (is_zero_pfn(pte_pfn(pteval))) {
@@ -768,6 +744,7 @@ static void __collapse_huge_page_copy(pte_t *pte, struct page *page,
 				spin_unlock(ptl);
 			}
 		} else {
+			mm_stats_set_flag(pftrace, MM_STATS_PF_HUGE_COPY);
 			src_page = pte_page(pteval);
 			copy_user_highpage(page, src_page, address, vma);
 			if (!PageCompound(src_page))
@@ -793,6 +770,8 @@ static void __collapse_huge_page_copy(pte_t *pte, struct page *page,
 		list_del(&src_page->lru);
 		release_pte_page(src_page);
 	}
+
+	mm_stats_hist_measure(&mm_huge_page_promotion_copy_pages_cycles, rdtsc() - start);
 }
 
 static void khugepaged_alloc_sleep(void)
@@ -973,7 +952,7 @@ khugepaged_alloc_page(struct page **hpage, gfp_t gfp, int node)
  */
 
 static int hugepage_vma_revalidate(struct mm_struct *mm, unsigned long address,
-		struct vm_area_struct **vmap)
+		struct vm_area_struct **vmap, bool force)
 {
 	struct vm_area_struct *vma;
 	unsigned long hstart, hend;
@@ -984,6 +963,8 @@ static int hugepage_vma_revalidate(struct mm_struct *mm, unsigned long address,
 	*vmap = vma = find_vma(mm, address);
 	if (!vma)
 		return SCAN_VMA_NULL;
+
+	if (force) return 0;
 
 	hstart = (vma->vm_start + ~HPAGE_PMD_MASK) & HPAGE_PMD_MASK;
 	hend = vma->vm_end & HPAGE_PMD_MASK;
@@ -1008,7 +989,8 @@ static int hugepage_vma_revalidate(struct mm_struct *mm, unsigned long address,
 static bool __collapse_huge_page_swapin(struct mm_struct *mm,
 					struct vm_area_struct *vma,
 					unsigned long haddr, pmd_t *pmd,
-					int referenced)
+					int referenced, bool force,
+					struct mm_stats_pftrace *pftrace)
 {
 	int swapped_in = 0;
 	vm_fault_t ret = 0;
@@ -1030,12 +1012,13 @@ static bool __collapse_huge_page_swapin(struct mm_struct *mm,
 			continue;
 		}
 		swapped_in++;
-		ret = do_swap_page(&vmf);
+		ret = do_swap_page(&vmf, pftrace);
+		mm_stats_set_flag(pftrace, MM_STATS_PF_SWAP);
 
 		/* do_swap_page returns VM_FAULT_RETRY with released mmap_lock */
 		if (ret & VM_FAULT_RETRY) {
 			mmap_read_lock(mm);
-			if (hugepage_vma_revalidate(mm, haddr, &vma)) {
+			if (hugepage_vma_revalidate(mm, haddr, &vma, force)) {
 				/* vma is no longer available, don't continue to swapin */
 				trace_mm_collapse_huge_page_swapin(mm, swapped_in, referenced, 0);
 				return false;
@@ -1060,10 +1043,11 @@ static bool __collapse_huge_page_swapin(struct mm_struct *mm,
 	return true;
 }
 
-static void collapse_huge_page(struct mm_struct *mm,
+static int collapse_huge_page(struct mm_struct *mm,
 				   unsigned long address,
 				   struct page **hpage,
-				   int node, int referenced, int unmapped)
+				   int node, int referenced, int unmapped,
+				   bool force, struct mm_stats_pftrace *pftrace)
 {
 	LIST_HEAD(compound_pagelist);
 	pmd_t *pmd, _pmd;
@@ -1075,6 +1059,7 @@ static void collapse_huge_page(struct mm_struct *mm,
 	struct vm_area_struct *vma;
 	struct mmu_notifier_range range;
 	gfp_t gfp;
+	u64 start = rdtsc();
 
 	VM_BUG_ON(address & ~HPAGE_PMD_MASK);
 
@@ -1090,6 +1075,7 @@ static void collapse_huge_page(struct mm_struct *mm,
 	mmap_read_unlock(mm);
 	new_page = khugepaged_alloc_page(hpage, gfp, node);
 	if (!new_page) {
+		mm_stats_set_flag(pftrace, MM_STATS_PF_HUGE_ALLOC_FAILED);
 		result = SCAN_ALLOC_HUGE_PAGE_FAIL;
 		goto out_nolock;
 	}
@@ -1101,7 +1087,7 @@ static void collapse_huge_page(struct mm_struct *mm,
 	count_memcg_page_event(new_page, THP_COLLAPSE_ALLOC);
 
 	mmap_read_lock(mm);
-	result = hugepage_vma_revalidate(mm, address, &vma);
+	result = hugepage_vma_revalidate(mm, address, &vma, force);
 	if (result) {
 		mmap_read_unlock(mm);
 		goto out_nolock;
@@ -1120,7 +1106,7 @@ static void collapse_huge_page(struct mm_struct *mm,
 	 * Continuing to collapse causes inconsistency.
 	 */
 	if (unmapped && !__collapse_huge_page_swapin(mm, vma, address,
-						     pmd, referenced)) {
+						     pmd, referenced, force, pftrace)) {
 		mmap_read_unlock(mm);
 		goto out_nolock;
 	}
@@ -1132,7 +1118,7 @@ static void collapse_huge_page(struct mm_struct *mm,
 	 * handled by the anon_vma lock + PG_lock.
 	 */
 	mmap_write_lock(mm);
-	result = hugepage_vma_revalidate(mm, address, &vma);
+	result = hugepage_vma_revalidate(mm, address, &vma, force);
 	if (result)
 		goto out_up_write;
 	/* check if the pmd is still valid */
@@ -1189,8 +1175,10 @@ static void collapse_huge_page(struct mm_struct *mm,
 	 */
 	anon_vma_unlock_write(vma->anon_vma);
 
+	pftrace->prep_start_tsc = rdtsc();
 	__collapse_huge_page_copy(pte, new_page, vma, address, pte_ptl,
-			&compound_pagelist);
+			&compound_pagelist, pftrace);
+	pftrace->prep_end_tsc = rdtsc();
 	pte_unmap(pte);
 	/*
 	 * spin_lock() below is not the equivalent of smp_wmb(), but
@@ -1214,6 +1202,9 @@ static void collapse_huge_page(struct mm_struct *mm,
 	spin_unlock(pmd_ptl);
 
 	*hpage = NULL;
+
+	// The rest is cheap.
+	mm_stats_hist_measure(&mm_huge_page_promotion_work_cycles, rdtsc() - start);
 
 	khugepaged_pages_collapsed++;
 	result = SCAN_SUCCEED;
@@ -1240,6 +1231,11 @@ static int khugepaged_scan_pmd(struct mm_struct *mm,
 	spinlock_t *ptl;
 	int node = NUMA_NO_NODE, unmapped = 0;
 	bool writable = false;
+	struct mm_cost_delta mm_cost_delta;
+	struct mm_action mm_action;
+	bool should_do;
+	struct mm_stats_pftrace pftrace; // dummy, not used
+	mm_stats_pftrace_init(&pftrace);
 
 	VM_BUG_ON(address & ~HPAGE_PMD_MASK);
 
@@ -1376,11 +1372,71 @@ out_unmap:
 		/* collapse_huge_page will return with the mmap_lock released */
 		collapse_huge_page(mm, address, hpage, node,
 				referenced, unmapped);
+		
+		// (markm) run the estimator to check if we should create a 2MB page.
+		mm_action.address = address;
+		mm_action.action = MM_ACTION_PROMOTE_HUGE;
+		mm_action.huge_page_order = HPAGE_PMD_ORDER;
+		mm_estimate_changes(&mm_action, &mm_cost_delta);
+		should_do = mm_decide(&mm_cost_delta);
+
+		if (should_do) {
+			node = khugepaged_find_target_node();
+			/* collapse_huge_page will return with the mmap_sem released */
+			collapse_huge_page(mm, address, hpage, node, referenced,
+					/* force */ false, &pftrace);
+		} else {
+			up_read(&mm->mmap_lock);
+			ret = SCAN_MM_ECON_CANCEL;
+		}
 	}
 out:
 	trace_mm_khugepaged_scan_pmd(mm, page, writable, referenced,
 				     none_or_zero, result, unmapped);
 	return ret;
+}
+
+int
+promote_to_huge(struct mm_struct *mm,
+		struct vm_area_struct *vma,
+		unsigned long address,
+		struct mm_stats_pftrace *pftrace)
+{
+	int node;
+	int result;
+	struct page *hpage = NULL;
+
+	pr_info("Attempting to promote %lx (vma=%p mm=%p)", address, vma, mm);
+
+	// Linux doesn't support huge pages for file-backed memory, which
+	// unfortunately rules out huge-page mappings for the text section.
+	if (vma->vm_file) {
+		pr_warn("Not promoting %lx: file-backed memory.", address);
+		return SCAN_FAIL;
+	}
+
+	down_read(&mm->mmap_lock);
+
+	node = khugepaged_find_target_node();
+	result = collapse_huge_page(mm, address, &hpage, node, 512,
+			/* force */ true, pftrace);
+
+	if (IS_ERR_OR_NULL(hpage)) {
+		pr_info("hpage is null or error");
+	} else {
+		put_page(hpage);
+	}
+
+	pr_info("Attempted to promote %lx: result=%d hpage=%p",
+			address, result, hpage);
+
+	if (result == SCAN_SUCCEED) {
+		mm_stats_set_flag(pftrace, MM_STATS_PF_HUGE_PROMOTION);
+	} else {
+		mm_stats_set_flag(pftrace, MM_STATS_PF_HUGE_PROMOTION_FAILED);
+	}
+
+	return result;
 }
 
 static void collect_mm_slot(struct mm_slot *mm_slot)
@@ -2249,8 +2305,18 @@ static int khugepaged_has_work(void)
 
 static int khugepaged_wait_event(void)
 {
-	return !list_empty(&khugepaged_scan.mm_head) ||
-		kthread_should_stop();
+	struct mm_cost_delta mm_cost_delta;
+    struct mm_action mm_action = {
+        .action = MM_ACTION_RUN_PROMOTION,
+        .unused = 0,
+    };
+    bool should_run;
+    mm_estimate_changes(&mm_action, &mm_cost_delta);
+    should_run = mm_decide(&mm_cost_delta);
+
+	return should_run &&
+        (!list_empty(&khugepaged_scan.mm_head) ||
+		kthread_should_stop());
 }
 
 static void khugepaged_do_scan(void)
@@ -2259,6 +2325,7 @@ static void khugepaged_do_scan(void)
 	unsigned int progress = 0, pass_through_head = 0;
 	unsigned int pages = READ_ONCE(khugepaged_pages_to_scan);
 	bool wait = true;
+	u64 start = rdtsc();
 
 	lru_add_drain_all();
 
@@ -2285,6 +2352,8 @@ static void khugepaged_do_scan(void)
 
 	if (!IS_ERR_OR_NULL(hpage))
 		put_page(hpage);
+	
+	mm_stats_hist_measure(&mm_huge_page_promotion_scanning_cycles, rdtsc() - start);
 }
 
 static bool khugepaged_should_wakeup(void)
