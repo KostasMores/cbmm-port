@@ -65,6 +65,7 @@
 #include <linux/vmalloc.h>
 #include <linux/io_uring.h>
 #include <linux/syscall_user_dispatch.h>
+#include <linux/mm_econ.h>
 
 #include <linux/uaccess.h>
 #include <asm/mmu_context.h>
@@ -1365,6 +1366,15 @@ int begin_new_exec(struct linux_binprm * bprm)
 	perf_event_exec();
 	__set_task_comm(me, kbasename(bprm->filename), true);
 
+	/* huge_addr checking */
+	if (strncmp(current->comm, huge_addr_comm, MAX_HUGE_ADDR_COMM) == 0) {
+		huge_addr_pid = current->pid;
+		pr_warn("Setting new huge_addr_pid=%d\n", huge_addr_pid);
+	} else {
+		//pr_info("NOT huge_addr process (%s) huge_addr_comm=%s.\n",
+		//		current->comm, huge_addr_comm);
+	}
+
 	/* An exec changes our domain. We are no longer part of the thread
 	   group */
 	WRITE_ONCE(me->self_exec_id, me->self_exec_id + 1);
@@ -1807,6 +1817,7 @@ static int bprm_execve(struct linux_binprm *bprm,
 		       int fd, struct filename *filename, int flags)
 {
 	struct file *file;
+	struct mm_struct *new_mm;
 	int retval;
 
 	retval = prepare_bprm_creds(bprm);
@@ -1851,6 +1862,17 @@ static int bprm_execve(struct linux_binprm *bprm,
 	rseq_execve(current);
 	acct_update_integrals(current);
 	task_numa_free(current, false);
+
+	// Bijan: If exec succeded, check if this is the process we want to track
+#ifdef CONFIG_MM_ECON
+	new_mm = current->mm;
+	mm_add_memory_range(current->tgid, SectionCode, new_mm->start_code, 0, 0,
+	    new_mm->end_code - new_mm->start_code, 0, 0, 0, 0);
+	mm_add_memory_range(current->tgid, SectionData, new_mm->start_data, 0, 0,
+	    new_mm->end_data - new_mm->start_data, 0, 0, 0, 0);
+	mm_add_memory_range(current->tgid, SectionHeap, new_mm->start_brk, 0, 0,
+	    new_mm->brk - new_mm->start_brk, 0, 0, 0, 0);
+#endif
 	return retval;
 
 out:
