@@ -47,6 +47,7 @@
 #include <linux/pkeys.h>
 #include <linux/oom.h>
 #include <linux/sched/mm.h>
+#include <linux/mm_econ.h>
 
 #include <linux/uaccess.h>
 #include <asm/cacheflush.h>
@@ -232,8 +233,14 @@ SYSCALL_DEFINE1(brk, unsigned long, brk)
 			      mm->end_data, mm->start_data))
 		goto out;
 
-	newbrk = PAGE_ALIGN(brk);
-	oldbrk = PAGE_ALIGN(mm->brk);
+	if (mm_process_is_using_cbmm(current->tgid)) {
+		newbrk = ALIGN(brk, HPAGE_SIZE);
+		oldbrk = ALIGN(mm->brk, HPAGE_SIZE);
+	} else {
+		newbrk = PAGE_ALIGN(brk);
+		oldbrk = PAGE_ALIGN(mm->brk);
+	}
+
 	if (oldbrk == newbrk) {
 		mm->brk = brk;
 		goto success;
@@ -281,6 +288,29 @@ success:
 	userfaultfd_unmap_complete(mm, &uf);
 	if (populate)
 		mm_populate(oldbrk, newbrk - oldbrk);
+	else if (newbrk > oldbrk && mm_econ_is_on() && mm_process_is_using_cbmm(current->tgid)) {
+		struct mm_cost_delta mm_cost_delta;
+		struct mm_action mm_action;
+		struct range *ranges = NULL;
+		int i = 0;
+		bool should_do;
+
+		mm_action.address = oldbrk;
+		mm_action.len = newbrk - oldbrk;
+		mm_action.action = MM_ACTION_EAGER_PAGING;
+		mm_estimate_changes(&mm_action, &mm_cost_delta);
+		should_do = mm_decide(&mm_cost_delta);
+
+		if (should_do) {
+			ranges = (struct range*)mm_cost_delta.extra;
+			while(ranges[i].start != -1 && ranges[i].end != -1) {
+				mm_populate(ranges[i].start, ranges[i].end - ranges[i].start);
+				i++;
+			}
+		}
+
+		if (ranges) vfree(ranges);
+	}
 	return brk;
 
 out:
@@ -1622,6 +1652,39 @@ unsigned long ksys_mmap_pgoff(unsigned long addr, unsigned long len,
 	}
 
 	retval = vm_mmap_pgoff(file, addr, len, prot, flags, pgoff);
+#ifdef CONFIG_MM_ECON
+	if (!IS_ERR((void*)retval)) {
+		struct mm_cost_delta mm_cost_delta;
+		struct mm_action mm_action;
+		struct range *ranges = NULL;
+		int i = 0;
+		bool should_do;
+		// Bijan: Potentially add this mmap to the tracked process's profile
+		u64 section_off = current->mm->mmap_base - retval;
+		mm_add_memory_range(current->tgid, SectionMmap, retval, section_off,
+				addr, len, prot, flags, fd, pgoff);
+
+		// Determine if we want to eagerly allocate parts of this mmap
+		if ( (flags & MAP_ANONYMOUS) && mm_econ_is_on() && mm_process_is_using_cbmm(current->tgid)) {
+			mm_action.address = retval;
+			mm_action.len = len;
+			mm_action.action = MM_ACTION_EAGER_PAGING;
+			mm_estimate_changes(&mm_action, &mm_cost_delta);
+			should_do = mm_decide(&mm_cost_delta);
+
+			if (should_do) {
+				ranges = (struct range*)mm_cost_delta.extra;
+				while(ranges[i].start != -1 && ranges[i].end != -1) {
+					mm_populate(ranges[i].start, ranges[i].end - ranges[i].start);
+					i++;
+				}
+			}
+
+			if (ranges) vfree(ranges);
+		}
+
+	}
+#endif
 out_fput:
 	if (file)
 		fput(file);
@@ -3042,6 +3105,7 @@ static int do_brk_flags(unsigned long addr, unsigned long len, unsigned long fla
 	pgoff_t pgoff = addr >> PAGE_SHIFT;
 	int error;
 	unsigned long mapped_addr;
+	u64 section_off;
 
 	/* Until we need other flags, refuse anything except VM_EXEC. */
 	if ((flags & (~VM_EXEC)) != 0)
@@ -3099,6 +3163,15 @@ out:
 	if (flags & VM_LOCKED)
 		mm->locked_vm += (len >> PAGE_SHIFT);
 	vma->vm_flags |= VM_SOFTDIRTY;
+
+#ifdef CONFIG_MM_ECON
+	// Bijan: If we expand the heap, add the new section to the tracked
+	// process's profile
+	section_off = addr - current->mm->start_brk;
+	mm_add_memory_range(current->tgid, SectionHeap, addr, section_off, 0, len,
+		0, 0, 0, 0);
+#endif
+
 	return 0;
 }
 
