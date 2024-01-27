@@ -4,11 +4,12 @@
 #define _MM_SHUFFLE_H
 #include <linux/jump_label.h>
 
-#define SHUFFLE_ORDER (MAX_ORDER-1)
+#define DEFAULT_SHUFFLE_ORDER (MAX_ORDER-1)
 
 #ifdef CONFIG_SHUFFLE_PAGE_ALLOCATOR
 DECLARE_STATIC_KEY_FALSE(page_alloc_shuffle_key);
 extern void __shuffle_free_memory(pg_data_t *pgdat);
+extern int page_alloc_shuffle_order;
 extern bool shuffle_pick_tail(void);
 static inline void __meminit shuffle_free_memory(pg_data_t *pgdat)
 {
@@ -29,7 +30,7 @@ static inline bool is_shuffle_order(int order)
 {
 	if (!static_branch_unlikely(&page_alloc_shuffle_key))
 		return false;
-	return order >= SHUFFLE_ORDER;
+	return order >= page_alloc_shuffle_order;
 }
 #else
 static inline bool shuffle_pick_tail(void)
