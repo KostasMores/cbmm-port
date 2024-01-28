@@ -5457,8 +5457,10 @@ unsigned long __alloc_pages_bulk(gfp_t gfp, int preferred_nid,
 			continue;
 		}
 
+		// This function allocates pages of order-0 so as mark said we should
+		// take from the front.
 		page = __rmqueue_pcplist(zone, 0, ac.migratetype, alloc_flags,
-								pcp, pcp_list);
+								pcp, pcp_list, true);
 		if (unlikely(!page)) {
 			/* Try and allocate at least one page */
 			if (!nr_account)
@@ -5575,7 +5577,7 @@ out:
 
 	// markm: update if we allocated a zeroed large allocation.
 	// For now, we mostly care about huge pages.
-	if (page && (gfp_mask & GFP_TRANSHUGE_LIGHT) && (order >= 9)) {
+	if (page && (gfp & GFP_TRANSHUGE_LIGHT) && (order >= 9)) {
 		lfpa_update(rdtsc());
 	}
 	
