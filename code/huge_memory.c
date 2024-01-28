@@ -73,6 +73,25 @@ struct huge_addr_range {
 	u64 end;
 };
 
+/*
+ * With the `huge_addr` sysfs flag, userspace can choose a single pid and
+ * 2MB-aligned address to make into a huge page.
+ *
+ * Values of 0 indicate that the value is unset. Otherwise, the PID must be a
+ * valid process ID and huge_addr must be a 2MB-aligned address.
+ *
+ * The mode toggles different modes of operations:
+ *   0: use huge_addr as a single address to make huge
+ *   1: use huge_addr as the highest allowed huge page
+ *   2: use huge_addr as the lowest allowed huge page
+ *   3: use huge_addr_ranges to see if a page should be huge
+ */
+int huge_addr_mode = 0;
+pid_t huge_addr_pid = 0;
+u64 huge_addr = 0;
+struct rb_root huge_addr_range_tree = RB_ROOT;
+char huge_addr_comm[MAX_HUGE_ADDR_COMM];
+
 void get_page_mapping(unsigned long address, unsigned long *pfn,
 		struct page **page, bool *is_huge)
 {
