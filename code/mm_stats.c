@@ -73,8 +73,8 @@ static int hist_sprintf(struct file *file, char __user *ubuf,
     \
     static struct proc_ops name##_ops = \
     { \
-        .write = name##_write_cb, \
-        .read = name##_read_cb, \
+        .proc_write = name##_write_cb, \
+        .proc_read = name##_read_cb, \
     };
 
 #define MM_STATS_PROC_CREATE_INT(type, name, default_val, fmt) \
@@ -94,7 +94,7 @@ static int hist_sprintf(struct file *file, char __user *ubuf,
     \
     static struct proc_ops name##_ops = \
     { \
-        .read = name##_read_cb, \
+        .proc_read = name##_read_cb, \
     };
 
 #define MM_STATS_INIT_MM_HIST(name) \
@@ -435,7 +435,7 @@ static ssize_t rejected_hash_read_cb(
 
 static struct proc_ops rejected_hash_ops =
 {
-    .read = rejected_hash_read_cb,
+    .proc_read = rejected_hash_read_cb,
 };
 
 
