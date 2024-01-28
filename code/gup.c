@@ -18,6 +18,7 @@
 #include <linux/migrate.h>
 #include <linux/mm_inline.h>
 #include <linux/sched/mm.h>
+#include <linux/mm_stats.h>
 
 #include <asm/mmu_context.h>
 #include <asm/tlbflush.h>
