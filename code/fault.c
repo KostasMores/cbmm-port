@@ -1568,7 +1568,7 @@ DEFINE_IDTENTRY_RAW_ERRORCODE(exc_page_fault)
 	state = irqentry_enter(regs);
 
 	instrumentation_begin();
-	huge = handle_page_fault(regs, error_code, address);
+	huge = handle_page_fault(regs, error_code, address, &pftrace);
 	instrumentation_end();
 
 	irqentry_exit(regs, state);
