@@ -12,6 +12,7 @@
 #include <linux/sched/loadavg.h>
 #include <linux/sched/task.h>
 #include <linux/rwsem.h>
+#include <linux/vmalloc.h>
 
 #define HUGE_PAGE_ORDER 9
 
