@@ -1368,11 +1368,6 @@ static int khugepaged_scan_pmd(struct mm_struct *mm,
 out_unmap:
 	pte_unmap_unlock(pte, ptl);
 	if (ret) {
-		node = khugepaged_find_target_node();
-		/* collapse_huge_page will return with the mmap_lock released */
-		collapse_huge_page(mm, address, hpage, node,
-				referenced, unmapped);
-		
 		// (markm) run the estimator to check if we should create a 2MB page.
 		mm_action.address = address;
 		mm_action.action = MM_ACTION_PROMOTE_HUGE;
