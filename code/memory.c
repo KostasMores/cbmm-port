@@ -4725,9 +4725,10 @@ static vm_fault_t handle_pte_fault(struct vm_fault *vmf,
 	if (!vmf->pte) {
 		if (vma_is_anonymous(vmf->vma))
 			return do_anonymous_page(vmf, pftrace);
-		else
+		else {
 			mm_stats_set_flag(pftrace, MM_STATS_PF_NOT_ANON);
 			return do_fault(vmf, pftrace);
+		}
 	}
 
 	if (!pte_present(vmf->orig_pte)) {
@@ -4811,7 +4812,7 @@ static vm_fault_t __handle_mm_fault(struct vm_area_struct *vma,
 	if (!vmf.pud)
 		return VM_FAULT_OOM;
 retry_pud:
-	if (pud_none(*vmf.pud) && __transparent_hugepage_enabled(vma)) {
+	if (pud_none(*vmf.pud) && __transparent_hugepage_enabled(vma, address)) {
 		// (markm) No entry present.
 
 		// (markm) run the estimator to check if we should create a 1GB page.
@@ -4859,7 +4860,7 @@ retry_pud:
 	if (pud_trans_unstable(vmf.pud))
 		goto retry_pud;
 
-	if (pmd_none(*vmf.pmd) && __transparent_hugepage_enabled(vma)) {
+	if (pmd_none(*vmf.pmd) && __transparent_hugepage_enabled(vma, address)) {
 		// (markm) No entry present.
 
 		// (markm) run the estimator to check if we should create a 2MB page.
