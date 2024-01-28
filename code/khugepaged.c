@@ -1214,7 +1214,7 @@ out_nolock:
 	if (!IS_ERR_OR_NULL(*hpage))
 		mem_cgroup_uncharge(*hpage);
 	trace_mm_collapse_huge_page(mm, isolated, result);
-	return;
+	return result;
 }
 
 static int khugepaged_scan_pmd(struct mm_struct *mm,
