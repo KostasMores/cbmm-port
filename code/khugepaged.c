@@ -1378,7 +1378,7 @@ out_unmap:
 		if (should_do) {
 			node = khugepaged_find_target_node();
 			/* collapse_huge_page will return with the mmap_sem released */
-			collapse_huge_page(mm, address, hpage, node, referenced,
+			collapse_huge_page(mm, address, hpage, node, referenced, unmapped,
 					/* force */ false, &pftrace);
 		} else {
 			up_read(&mm->mmap_lock);
@@ -1398,6 +1398,7 @@ promote_to_huge(struct mm_struct *mm,
 		struct mm_stats_pftrace *pftrace)
 {
 	int node;
+	int unmapped = 0;
 	int result;
 	struct page *hpage = NULL;
 
@@ -1413,7 +1414,7 @@ promote_to_huge(struct mm_struct *mm,
 	down_read(&mm->mmap_lock);
 
 	node = khugepaged_find_target_node();
-	result = collapse_huge_page(mm, address, &hpage, node, 512,
+	result = collapse_huge_page(mm, address, &hpage, node, 512, unmapped,
 			/* force */ true, pftrace);
 
 	if (IS_ERR_OR_NULL(hpage)) {
