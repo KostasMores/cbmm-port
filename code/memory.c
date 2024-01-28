@@ -76,6 +76,7 @@
 // New
 #include <linux/mm_econ.h>
 #include <linux/mm_stats.h>
+#include <linux/memory.h>
 
 
 #include <trace/events/kmem.h>
@@ -175,10 +176,10 @@ static ssize_t dump_mapping_write_cb(
 	return len;
 }
 
-static struct file_operations dump_mapping_ops =
+static struct proc_ops dump_mapping_ops =
 {
-	.write = dump_mapping_write_cb,
-	.read = dump_mapping_read_cb,
+	.proc_write = dump_mapping_write_cb,
+	.proc_read = dump_mapping_read_cb,
 };
 
 void init_dump_mapping(void)
