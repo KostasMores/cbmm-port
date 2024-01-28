@@ -3423,7 +3423,7 @@ copy:
 	get_page(vmf->page);
 
 	pte_unmap_unlock(vmf->pte, vmf->ptl);
-	return wp_page_copy(vmf);
+	return wp_page_copy(vmf, pftrace);
 }
 
 static void unmap_mapping_range_vma(struct vm_area_struct *vma,
@@ -4336,7 +4336,7 @@ static vm_fault_t do_read_fault(struct vm_fault *vmf, struct mm_stats_pftrace *p
 	return ret;
 }
 
-static vm_fault_t do_cow_fault(struct vm_fault *vmf)
+static vm_fault_t do_cow_fault(struct vm_fault *vmf, struct mm_stats_pftrace *pftrace)
 {
 	struct vm_area_struct *vma = vmf->vma;
 	vm_fault_t ret;
